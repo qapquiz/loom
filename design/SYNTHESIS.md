@@ -43,15 +43,15 @@ Wire types stay unexported inside hc. UI imports hc, never wire. Compiler-enforc
 
 `pane.Screen` is the only type crossing emulator state to UI. Cols, Rows, Cells (row-major, with a Wide flag for double-width runes, from candidate B's PaneCell), Cursor, Title, Status, MouseOn. Status comes from hc's OSC 7501 status events for the sidebar; Screen carries the ProgramStatus effect value for the pane header. MouseOn reflects tracking mode and tells bloom to stand down its MouseMode and selection when the program owns the mouse.
 
-## Flagged assumptions to resolve
+## Flagged assumptions, resolved
 
-- bloom cell draw path. Orchestrator reads bloom's canvas docs before wave 2. Screen shape survives a styled-lines fallback unchanged.
-- RenderState per-cell reads vs Formatter-only. Implementer verifies against the bindings source in wave 1.
-- Terminal resize API name. Verify in the bindings doc.go.
-- hc socket discovery (env var plus default path). Confirm at U2 against the live core.
-- OSC 7501 status vocabulary. Confirm from hc schema at U2.
+- bloom cell draw path, RESOLVED by reading the source this session. Nodes have no per-cell draw API. The node contract is `View() string` (bloom parses it into cells); `canvas.Surface` with `Set` and `Reach` is for effects only, and effects are compared with `==`, so a function-based effect would break the idle-frame skip. Therefore PaneNode renders Screen into a styled string (direct SGR assembly from cells, no lipgloss) and returns it. Cost: one assemble pass plus one bloom parse pass per changed pane frame, and bloom's own unchanged-frame cache makes idle panes free. Ultraviolet cells carry Width for wide glyphs, so Screen's Wide flag maps cleanly. U6 validates the number.
+- RenderState per-cell reads vs Formatter-only, RESOLVED by the wave 1 implementer against the bindings source: RenderStateRowIterator and RenderStateRowCells give real per-cell reads, valid until the next Update. The cheap Screen path stands.
+- Terminal resize API, RESOLVED: `Terminal.Resize(cols, rows uint16, cellWidthPx, cellHeightPx uint32)`, pixel args passable as 0 headless.
+- hc socket discovery, RESOLVED in wave 1: HC_SOCKET, HC_TERMINAL_SOCKET, HC_SESSION, then XDG paths.
+- OSC 7501 status vocabulary: still to confirm from hc schema during wave 2's U5 work.
 
 ## Wave plan
 
-- Wave 1, now: hc package (Dial, DialConn, hello, framed, events, attach, credit, negotiation), room, pane (Screen, publish, reconcile, stream machine), loopback testcore. U2, U3, U4 seams green.
-- Wave 2, after the bloom cell-path read: ui App, PaneNode, sidebar, cmd. U5 real-surface vim gate. U6 benchmarks, run through the benchmark-checklist skill before any number is reported.
+- Wave 1, done and verified: hc package, room, pane, loopback testcore. Race-clean suite, vet clean.
+- Wave 2, now: ui App, PaneNode as View-string renderer from Screen, sidebar, keymap, cmd. U5 real-surface vim gate, run by the orchestrator on a live core. U6 benchmarks, through the benchmark-checklist skill before any number is reported.

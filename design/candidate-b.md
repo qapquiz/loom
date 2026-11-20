@@ -1,150 +1,3 @@
-            p.handleInput(in) // see below
-         case <-p.pump.sizeTick.C: // 50 ms coalescing
-            if p.pump.pending != p.pump.lastSent && p.pump.phase == PhaseLive {
-               conn.Send(Resize(p.ch, p.pump.pending))       // u16 LE cols, rows
-               p.pump.term.Resize(x, y)                       // verified API (doc.go)
-               p.pump.lastSent = p.pump.pending
-            }
-         }
-      }
-   }
-
-   func (p *Pane) handleInput(in Input) {
-      switch in.Kind {
-      case InputKey:
-         p.pump.keyEnc.SetFromTerminal(p.pump.term) // modes → kitty flags etc.
-         b, err := p.pump.keyEnc.Encode(...)        // KeyEvent built pump-side
-         conn.Send(Data(p.ch, b))                   // legacy or kitty, encoder's call
-      case InputMouse:
-         p.pump.mouseEnc.SetFromTerminal(p.pump.term) // tracking mode sync (SGR vs X10...)
-         b, err := p.pump.mouseEnc.Encode(...)
-         if len(b) > 0 { conn.Send(Data(p.ch, b)) }
-      case InputSize:
-         p.pump.pending = in.Size // sent by sizeTick, coalesced
-      case InputFocus:
-         conn.Send(Focus(p.ch, in.Focus)) // 1 gained / 0 lost
-      }
-   }
- ```
-
- Two properties fall out for free. First, ordering: the emulator's answers to program queries (DA, ENQ, XTGETTCAP, size reports) are produced by the WritePty effect during VTWrite — synchronously, on
- the pump — and flushed as AUTOMATIC_INPUT immediately after, so query/reply order can never interleave wrongly. Second, negotiation: hello requests automatic_input in features; the attach reply's
- confirmation sets p.pump.auto; until it is true, flushReplies drops (an old core would ignore frame kind 6 anyway, but loom never sends it — belt and suspenders, one field, no sync flags).
-
- Flow control and desync. The pump is never slow (VTWrite+Update is µs), so feed (buffered 256) practically never fills and the demux never blocks on a pane — honoring hc's guarantee that a stalled
- stream never blocks channel 0. The safety valve: if feed is somehow full, the demux drops the payload and does not credit it; hc then falls >4 MiB behind and sends a fresh repaint; the pump, seeing
- it set a desync note on drop, emits EvDesync and the reducer takes the ActDetachAndAttach path (a fresh attach is a byte-stream-aligned first paint — no partial-sequence repair logic exists
- anywhere).
-
- ### Resize plumbing
-
- Rule: the last active viewer sets the size. Loom becomes the last active viewer by attaching, so on attach it sends RESIZE(cols, rows) (attach params) and thereafter its current rect is
- authoritative. The flow: bloom composites the tree and records each node's rectangle on the returned tea.View.Frame → SyncResize reads the pane node's content rect (inside borders), and if it
- differs from the last sent size posts Pane.NeedSize(cols, rows) → the pump's 50 ms tick coalesces bursts (border drags relayout every frame) → one RESIZE frame per settled layout, plus term.Resize
- so the local emulator stays size-consistent with the pty. When the pane is not in PhaseLive the pump refuses the send (reducer-derived check); on re-attach the size is re-sent, which is exactly the
- last-active-viewer contract. Rects clamp to ≥ 2×2 before encoding (u16, and terminals degenerate below that).
-
- ### Input routing summary (one table, one place)
-
- ┌─────────────────────┬──────────────────────────────────────┬───────────────────────────────────────┬─────────────────┐
- │ UI event            │ lane                                 │ pump action                           │ hc frame        │
- ├─────────────────────┼──────────────────────────────────────┼───────────────────────────────────────┼─────────────────┤
- │ tea.KeyMsg          │ ui.ToPaneKey → hc.KeyEvent value     │ KeyEncoder.SetFromTerminal + Encode   │ DATA            │
- ├─────────────────────┼──────────────────────────────────────┼───────────────────────────────────────┼─────────────────┤
- │ tea.MouseMsg        │ ui.ToPaneMouse (abs → pane-relative) │ MouseEncoder.SetFromTerminal + Encode │ DATA            │
- ├─────────────────────┼──────────────────────────────────────┼───────────────────────────────────────┼─────────────────┤
- │ program query bytes │ WritePty effect during VTWrite       │ flush after Update, if auto confirmed │ AUTOMATIC_INPUT │
- ├─────────────────────┼──────────────────────────────────────┼───────────────────────────────────────┼─────────────────┤
- │ layout change       │ SyncResize → NeedSize                │ pending size, 50 ms tick              │ RESIZE          │
- ├─────────────────────┼──────────────────────────────────────┼───────────────────────────────────────┼─────────────────┤
- │ focus change        │ SendInput{Focus}                     │ —                                     │ FOCUS           │
- └─────────────────────┴──────────────────────────────────────┴───────────────────────────────────────┴─────────────────┘
-
- Test seams (one obvious check per unit)
-
- - U1 bindings hello — seam: extracted buildPaneFrame + bindings Terminal, no sockets. TestPaneFrameFromANSI: NewTerminal(80×24), VTWrite a known ANSI fixture (colors, wide rune, cursor moves,
-   reverse video), Update, buildPaneFrame, assert exact cells at named coordinates, plus Formatter plain-text cross-check. Pins the PaneFrame shape before any socket code exists.
- - U2 hc session — two seams. (a) Pure: recorded notification JSON lines → parse → Event → Registry.Apply → expected registry map, including the missed/watermark drop rule (table-driven, no socket).
-   (b) Live: Connect to the real core, Subscribe, assert the libbuild terminal record appears in the snapshot (per PLAN).
- - U3 attach — seam: the pump's feed channel, frames injected directly (bypassing the socket), plus a real attach end-to-end. Pump consumes a fixture first-paint, Update, publish; assert Frame() cell
-   grid matches. Reducer table test lives here too: feed the transition table's lost→restarted→attached sequences to Step. Also pins the term.Resize API assumption.
- - U4 input — seam: a fake core listener (a net.Listener on a temp socket speaking hcwire frames) with a scripted attach reply carrying automatic_input: true. Assert: key inputs produce DATA frames
-   with the expected legacy sequences; query bytes in the stream produce AUTOMATIC_INPUT frames with the right replies; mouse-tracking mode bytes followed by mouse inputs produce SGR sequences. Live
-   variant per PLAN: real core, child shell, post echo hi\r, screen shows hi — the end-to-end proof.
- - U5 bloom frame — two seams. (a) SizeSink interface: SyncResize calls Pane.NeedSize through a one-method interface, so a spy records RESIZE payloads when a tree is rendered at two sizes — pure, no
-   surface. (b) Real surface per PLAN: run loom in an hc pane running vim, capture, assert vim's UI renders; resize the pane, assert vim redraws (proves RESIZE + term.Resize + repaint loop). This
-   unit also resolves the bloom cell-path assumption.
-
- Rationale
-
- ### Shape — load-bearing decisions
-
- - One pump goroutine per pane owns every ghostty handle (single source of truth per invariant, separate-before-serializing-shared-state). The bindings contract ("handles are single-goroutine; Update
-   under exclusive access, reads safe after") becomes a property of the architecture rather than a discipline callers must keep: there is exactly one goroutine that can touch the Terminal, and
-   buildPaneFrame runs on it immediately after Update — inside the contract's safe window, not merely adjacent to it. The UI never touches RenderState, so the contract cannot be violated by a future
-   UI change.
- - The boundary is one immutable value, published atomically (encode-lessons-in-structure). atomic.Pointer[PaneFrame] + a coalesced signal means readers can never see a torn frame and can never block
-   the pump. Immutability is enforced by the type being plain copied values only (the bindings guarantee retention safety for Cell-like values after Update).
- - One event alphabet for the reducer, including loom's own outcomes (no hand-synced state). EvAttached, EvChannelClosed, EvDesync, EvSnapshot are synthesized into Event so Step has a single input
-   kind and the transition table is exhaustive by construction. No phase is ever represented twice — attach-in-flight is PhaseAttaching, not attaching bool.
- - Domain structs cross the ui→pane channel, not ghostty handles (boundary-discipline). KeyEvent/MouseEvent are plain values; encoders are constructed and synced pump-side, satisfying the encoders'
-   own "caller must serialize access" notes trivially.
- - Wire parsing dies in hcwire (make internals unreachable). ui imports hc, never hcwire; the compiler enforces the constraint. hc exports domain types only; nothing about [u32][u8][u32] framing or
-   JSON-RPC is nameable outside hcwire.
- - Interface depth, judged: the public surface is nine methods and five types, behind which hides the plain→framed handshake, credit accounting, demultiplexing, snapshot resync, effect routing,
-   encoder mode sync, and coalescing. The caller's total knowledge is: connect, list, attach, subscribe, read frame, send input, close. That is the trade the spike exists to validate — and the parts
-   most likely to be wrong (bloom cell path, resize API, status vocabulary) are each pinned by a named unit test seam before they can spread.
-
- ### Tradeoffs accepted
-
- - We accept a fresh Cells allocation per publish (~150 KB at 200×60, only when dirty) in exchange for lock-free reads and zero torn-frame risk; a pump-side arena or double buffer is a
-   U6-benchmark-driven change, not a design change.
- - We accept one channel hop of input latency (UI → pump) in exchange for strict single-goroutine handle ownership; no locks exist anywhere in the design.
- - We accept detach+reattach as the desync repair, in exchange for having no partial-stream resynchronization logic at all.
- - We accept that agent status comes only from hc's status events (one hop of possible lag vs the local ProgramStatus effect) in exchange for one source of truth that works identically for attached
-   and unattached panes.
- - We accept no auto-retry on EvAttachFailed in M1 (user action retries) to keep the reducer free of timers.
- - We accept dropping scrollback history from the first paint on the floor in M1; the viewport-only PaneFrame is why this is cheap to add later.
- - We accept single-pane scope; the registry and reducer are pane-count-neutral, so M2 splits and tabs need no redesign — only more pane instances.
-
- ### Alternatives considered
-
- 1. UI reads RenderState directly under the bindings contract (shared read window, handshake per frame). Lost: it spreads the concurrency contract into the ui package — every bloom frame needs a
-    "safe to read?" negotiation with the pump, and a future contributor reading only model.go can't see why. This shape hides strictly less: the pump must exist anyway; the only question is whether
-    the contract leaks past it.
- 2. Styled-strings boundary ([]styled lines published per paint, node renders strings). Lost: bloom re-parses strings every frame; at 120 fps against a pane publishing at content rate, the parse cost
-    is paid where it can't be coalesced, and cell fidelity (wide chars, cursor styling, reverse video on the cursor cell) degrades into ad-hoc string surgery. It is kept only as the defined fallback,
-    not the design.
- 3. Everything on the tea goroutine (model.Update performs VTWrite via queued bytes; tea owns all handles). Lost: rendering blocks on socket I/O, or — if the demux stays separate — every DATA frame
-    becomes a tea.Msg, flooding the message loop at output rates terminals easily sustain. The coalescing pump decouples output rate from fps with one channel.
-
- ### Open questions and risks
-
- - bloom cell draw path: is canvas.Surface/Drawable real, stable enough, and cell-oriented as the docs index suggests? U5 resolves; the styled-lines fallback is specified, so this is a cost risk, not
-   a design risk.
- - Status vocabulary: what exact values does OSC 7501 carry (idle/running/waiting/…)? Confirm from the schema README at U2; AgentStatus constants are placeholders until then.
- - Socket discovery: what is hc.DefaultSocket() — env var, well-known path, both? Confirm at U2.
- - Attach reply fields: confirm the automatic_input confirmation field name and whether attach params carry initial size (making the explicit post-attach RESIZE redundant-but-harmless). U2/U4.
- - term.Resize vs repaint latency: after a local resize, the program's repaint arrives as deltas; if some programs need a nudge, does hc forward a SIGWINCH-equivalent promptly? Watch this in U5's vim
-   check.
-
- ### Next implementation step
-
- Write the U1 test and buildPaneFrame against a hardcoded PaneFrame — pinning cell extraction from the bindings' row iterators before any socket code, since that is the cheapest place to discover
- whether the boundary type's shape survives contact with real cell data.
-
- ### Synthesis decision
-
- Pending — filled by arena synthesis.
-
-
- <hc from="t3w">Your full package scrolled past what the orchestrator could recover. Re-output ONLY the missing opening sections of your candidate package, as plain text in this order: (1) the
- package title line, (2) the problem statement, (3) the usage sketch with every call site. Do not repeat your type sketch, module map, or anything after the usage. Keep it tight.</hc>
-
-
- The orchestrator says the opening scrolled past. Re-output only: (1) title line, (2) problem statement, (3) usage sketch with every call site. No type sketch, module map, or anything after. Plain
- text, tight.
-
  loom M1 — candidate B: one pump per pane, one type across the boundary
 
  Problem
@@ -253,383 +106,475 @@
  That is the whole public surface: Connect, List, Subscribe, Attach, Close on Session; SendInput, NeedSize, Frame, PaintChan, Close on Pane; Event, Registry, PaneFrame, KeyEvent/MouseEvent domain
  structs. The caller never sees a frame, a JSON-RPC message, or a ghostty handle.
 
+ encoder input type is bindings'. If ui constructs bindings key structs and hands them via hc.Input, hc package and ui package both reference libghostty types — fine, both may depend on it. Simplest:
+ ui maps tea.KeyMsg → ghostty input key directly, pump encodes. Decide: Input.Key holds the bindings key type (type alias in hc? just use the bindings type). But then hc.Input exposes bindings type
+ to ui — ui imports bindings anyway. OK.
 
+ Hmm, wait — is that right though? libghostty key encoding might need the key event the way ghostty models it (keybinds.Key from the bindings). tea.KeyMsg → that mapping is real work (shifted chars,
+ ctrl codes, kitty). ui/input.go owns it. ✔
 
+ pane:
 
- ### Module map
- ```
-   loom/
-   ├── cmd/loom/main.go          // thin shell: flags, connect/list/attach, tea.Run (~80 lines)
-   ├── internal/hcwire/          // bytes and frames only. stdlib. imported by nobody but hc.
-   │   ├── frame.go              //   Frame, Kind, [ch u32 LE][kind u8][len u32 LE][payload] codec
-   │   ├── conn.go               //   Connect: dial → plain hello{framed:true} → framed Conn
-   │   └── rpc.go                //   JSON-RPC over channel 0: Call, Notify, ParseNotification
-   ├── internal/hc/              // the domain API. imports hcwire + libghostty only.
-   │   ├── session.go            //   Session, Connect, List, Subscribe, Attach, demux loop
-   │   ├── events.go             //   Event (one alphabet), Kind, Registry (seq + snapshot)
-   │   ├── terminal.go           //   TerminalInfo, AgentStatus parse (OSC 7501 via hc)
-   │   ├── reducer.go            //   Phase, Action, Step() — pure state machine
-   │   ├── pane.go               //   Pane, pump goroutine, Input, publish
-   │   └── paneframe.go          //   PaneFrame, PaneCell — THE boundary type
-   └── internal/ui/              // imports bloom, bubbletea, hc. never hcwire.
-       ├── model.go              //   tea.Model, message lanes, rearm cmds
-       ├── panenode.go           //   bloom node blitting PaneFrame cells
-       ├── input.go              //   tea.KeyMsg/MouseMsg → hc.KeyEvent/MouseEvent (domain structs)
-       └── resize.go             //   SyncResize: bloom Frame rect → Pane.NeedSize
- ```
- Dependency direction is a DAG: ui → hc → hcwire, hc → libghostty. hcwire is internal, so an import from ui fails the build — the "never leak wire types" rule is enforced by the compiler, not review.
- ### The boundary type
- PaneFrame is the only type that carries emulator state to the UI. It is screen content only — title and status live in the registry, fed by hc's title/status events, so the badge channel is uniform
- for attached and unattached panes and there is no second source of truth.
  ```go
-   // internal/hc/paneframe.go
-   // PaneFrame is the complete visible state of one terminal's screen.
-   // Published by the pane pump after each RenderState.Update and stored
-   // atomically; readers treat it as immutable. Plain copied values only,
-   // per the bindings contract (GridRef views die at the next Update).
-   type PaneFrame struct {
-      Cols, Rows       int
-      Cells            []PaneCell // row-major, len == Cols*Rows
-      CursorX, CursorY int        // viewport coords; meaningful when CursorVisible
-      CursorVisible    bool
-      CursorStyle      libghostty.CursorStyle // block/bar/underline
-   }
-   // PaneCell is one screen cell. Copyable plain value, retained freely.
-   type PaneCell struct {
-      Rune  rune
-      Fg, Bg Color    // 0x00RRGGBB, DefaultColor = max uint32
-      Flags CellFlags // bold | italic | underline | strikethrough | reverse
-      Wide  bool      // this cell is the head of a double-width rune
-   }
-   // buildPaneFrame copies the rendered viewport out of the render state into
-   // a fresh PaneFrame. Runs on the pump goroutine only, after RenderState.Update
-   // returned (reads are contract-safe there). Allocates Cells per publish in M1.
-   func buildPaneFrame(rs *libghostty.RenderState, prev *PaneFrame) *PaneFrame {
-      not implemented // row iterator → PaneCell copy; cursor via RenderStateCursor
-   }
- ```
- What the bloom node consumes per frame and why it is cheap. The node consumes the model's cached *PaneFrame pointer (swapped only when the pump publishes). Per bloom frame it blits cells
- row-run-wise into bloom's cell canvas — zero string parsing, no lipgloss re-parse, the exact cost bloom's docs warn about for styled strings. Cost is O(visible cells) on change; bloom's own
- unchanged-frame fast path (~0.02 ms) covers everything outside the pane rect. Publish rate is bounded by content: RenderState.Update reports dirty state, and the pump skips the publish entirely when
- RenderStateDirtyFalse, so an idle pane costs bloom nothing and a busy pane costs one blit per coalesced paint signal, not per fps. Flagged assumption: bloom's cell-level draw path
- (canvas.Surface/Drawable) was not fully read this session. Primary path targets it; the defined fallback is a node-side cache of styled lines built once per PaneFrame swap (re-parse cost then tracks
- pane publishes instead of bloom frames) — viable but strictly worse, so U5 resolves this first.
- ### Session and the events alphabet
- ```go
-   // internal/hc/session.go
-   // Session is a live connection to one hc core process.
-   type Session struct {
-      conn   *hcwire.Conn
-      rpc    *hcwire.RPC
-      events chan Event        // delivered to the app; read loop never blocks on it
-      panes  map[uint32]*Pane  // channel → pane; written by Attach/Close under mu
-      mu     sync.Mutex
-      done   chan struct{}
-   }
-   func Connect(path string) (*Session, error) { not implemented } // hcwire.Connect + demux goroutine
-   func (s *Session) List() ([]TerminalInfo, error) { not implemented }
-   func (s *Session) Subscribe() (<-chan Event, error) { not implemented }
-   func (s *Session) Attach(id string, opts AttachOpts) (*Pane, error) { not implemented }
-   func (s *Session) Close() { not implemented }
- ```
- The demux loop owns conn.Recv() and never blocks: channel 0 goes to the RPC dispatcher, channel N to panes[N]'s buffered feed channel. Attach is internally sequenced so there is no gap — the RPC
- resolves, the Pane and its pump are constructed and registered under mu, and only then does Attach return; first-paint DATA frames can only arrive after the core processed the attach, so
- registration happens-before delivery.
- ```go
-   // internal/hc/events.go
-   // Event is ONE alphabet: every hc notification kind plus loom-synthesized
-   // outcomes, so downstream code (registry, reducer) has a single input
-   // vocabulary and no parallel boolean bookkeeping.
-   type Event struct {
-      Seq      uint64 // hc's per-process seq; 0 for loom-synthesized
-      Term     string // terminal id
-      Kind     Kind
-      Status   AgentStatus     // EvStatus
-      Title    string          // EvTitle
-      Size     image.Point     // EvSize
-      ExitCode int             // EvFinished, EvChannelClosed
-      Snapshot []TerminalInfo  // EvSnapshot (missed → fresh registry)
-   }
-   type Kind uint8
-   const (
-      EvCreated Kind = iota; EvLost; EvRestarted; EvKeep; EvFinished; EvRemoved
-      EvStatus; EvTurn; EvTitle; EvLabels; EvSize; EvForeground
-      // loom-synthesized:
-      EvAttached      // attach RPC resolved
-      EvAttachFailed  // attach RPC errored
-      EvChannelClosed // CLOSE frame on the pane channel (reason + exit code)
-      EvDesync        // pump dropped stream bytes; needs detach+reattach
-      EvSnapshot      // missed arrived: replace registry wholesale
-   )
-   // Registry applies events with a seq watermark: replaces its map on
-   // EvSnapshot, drops any event whose Seq ≤ watermark. Pure except for its
-   // own map; the app-side self-heal for any delivery gap is the next
-   // EvSnapshot (see below).
-   type Registry struct { not implemented }
-   func (r *Registry) Apply(ev Event) { not implemented }
-   func (r *Registry) Title(id string) string { not implemented }
-   func (r *Registry) Status(id string) AgentStatus { not implemented }
- ```
- Snapshot/missed resync. Events flow on one channel; every Event carries Seq. On EvSnapshot (hc's missed + fresh snapshot) the Registry replaces its map and sets the watermark to the snapshot's seq;
- queued events with seq ≤ watermark are dropped on Apply. Because the watermark lives in the Registry (app side) rather than a shared counter, no locks are needed: the demux produces, the app
- consumes, the watermark arbitrates. Two self-heals compose: (a) if hc itself declares us behind, missed arrives and heals; (b) if loom's own events channel overflows (app stalled), Subscribe
- re-issues events.subscribe internally, which returns a fresh snapshot through the same EvSnapshot path — the app cannot tell the difference, by construction. If a snapshot arrives without the
- attached pane's id, the demux synthesizes EvRemoved for it and the reducer handles detach through the normal path. seq restarts per core process; a core restart kills the socket, so Session treats
- it as Close — the app exits with a message in M1, no auto-reconnect.
- ### Pane lifecycle as a pure state machine
- ```go
-   // internal/hc/reducer.go
-   type Phase uint8
-   const (
-      PhaseKnown       Phase = iota // record listed, not attached
-      PhaseAttaching                // attach RPC in flight
-      PhaseLive                     // channel open, first paint consumed
-      PhaseReattaching              // lost: record persists, channel closed
-      PhaseExited                   // program finished
-      PhaseGone                     // removed from the core
-   )
-   type Action uint8
-   const (
-      ActNone Action = iota
-      ActAttach          // open channel, create pump
-      ActDetach          // CLOSE the channel, keep the record
-      ActDetachAndAttach // desync path: close, then attach again
-   )
-   // Step is the entire lifecycle: phase in, event in → phase out, action for
-   // the owner. Pure. No I/O. No booleans anywhere — attach-in-flight, desync,
-   // and channel-closed are phases reached via the synthesized kinds.
-   // This is the lifecycle test seam (table-driven, no sockets).
-   func Step(phase Phase, ev Event) (Phase, Action) { not implemented }
- ```
- Transition table (the implementation is this table, nothing else):
- ┌─────────────┬──────────────────────────────────────────────────────────────┬─────────────┬─────────────────────────────────────────┐
- │ phase       │ event                                                        │ next        │ action                                  │
- ├─────────────┼──────────────────────────────────────────────────────────────┼─────────────┼─────────────────────────────────────────┤
- │ Known       │ keep, status, title, size, turn, labels, foreground, created │ Known       │ none                                    │
- ├─────────────┼──────────────────────────────────────────────────────────────┼─────────────┼─────────────────────────────────────────┤
- │ Known       │ EvAttached                                                   │ Live        │ none (pump already running)             │
- ├─────────────┼──────────────────────────────────────────────────────────────┼─────────────┼─────────────────────────────────────────┤
- │ Known       │ EvAttachFailed                                               │ Known       │ none (retry is a user action in M1)     │
- ├─────────────┼──────────────────────────────────────────────────────────────┼─────────────┼─────────────────────────────────────────┤
- │ Known       │ removed                                                      │ Gone        │ none                                    │
- ├─────────────┼──────────────────────────────────────────────────────────────┼─────────────┼─────────────────────────────────────────┤
- │ Attaching   │ EvAttached                                                   │ Live        │ none                                    │
- ├─────────────┼──────────────────────────────────────────────────────────────┼─────────────┼─────────────────────────────────────────┤
- │ Attaching   │ EvAttachFailed                                               │ Known       │ ActDetach (defensive channel close)     │
- ├─────────────┼──────────────────────────────────────────────────────────────┼─────────────┼─────────────────────────────────────────┤
- │ Attaching   │ lost, removed                                                │ Gone        │ ActDetach                               │
- ├─────────────┼──────────────────────────────────────────────────────────────┼─────────────┼─────────────────────────────────────────┤
- │ Live        │ lost                                                         │ Reattaching │ ActDetach                               │
- ├─────────────┼──────────────────────────────────────────────────────────────┼─────────────┼─────────────────────────────────────────┤
- │ Live        │ EvChannelClosed{reason=exited}                               │ Exited      │ ActDetach (record exit code for the UI) │
- ├─────────────┼──────────────────────────────────────────────────────────────┼─────────────┼─────────────────────────────────────────┤
- │ Live        │ EvChannelClosed{other}, EvDesync                             │ Reattaching │ ActDetachAndAttach                      │
- ├─────────────┼──────────────────────────────────────────────────────────────┼─────────────┼─────────────────────────────────────────┤
- │ Live        │ status, title, size, turn, labels, foreground, keep          │ Live        │ none (registry metadata only)           │
- ├─────────────┼──────────────────────────────────────────────────────────────┼─────────────┼─────────────────────────────────────────┤
- │ Live        │ restarted                                                    │ Live        │ none (should not happen; logged)        │
- ├─────────────┼──────────────────────────────────────────────────────────────┼─────────────┼─────────────────────────────────────────┤
- │ Reattaching │ restarted, created                                           │ Attaching   │ ActAttach                               │
- ├─────────────┼──────────────────────────────────────────────────────────────┼─────────────┼─────────────────────────────────────────┤
- │ Reattaching │ removed                                                      │ Gone        │ none (already detached)                 │
- ├─────────────┼──────────────────────────────────────────────────────────────┼─────────────┼─────────────────────────────────────────┤
- │ Reattaching │ EvSnapshot without id                                        │ Gone        │ none                                    │
- ├─────────────┼──────────────────────────────────────────────────────────────┼─────────────┼─────────────────────────────────────────┤
- │ Exited      │ restarted, created                                           │ Attaching   │ ActAttach (user restarts via core)      │
- ├─────────────┼──────────────────────────────────────────────────────────────┼─────────────┼─────────────────────────────────────────┤
- │ Exited      │ removed                                                      │ Gone        │ none                                    │
- ├─────────────┼──────────────────────────────────────────────────────────────┼─────────────┼─────────────────────────────────────────┤
- │ Gone        │ created                                                      │ Known       │ none                                    │
- └─────────────┴──────────────────────────────────────────────────────────────┴─────────────┴─────────────────────────────────────────┘
- All writes (SendInput, NeedSize, RESIZE/FOCUS/AUTOMATIC_INPUT frames) are refused unless the pane is in PhaseLive — one check in the pump, derived from the phase, never a parallel flag. Status
- arrives via hc's status events (OSC 7501 reports relayed by the core); ProgramStatus effect is deliberately unused in M1 — one source of truth, see Tradeoffs.
- ### Pane: the single-owner pump
- ```go
-   // internal/hc/pane.go
-   // Input is one UI→pane request. Keys, mouse, size, and focus ride one type
-   // so the pump has one inbox and ordering is trivially serial.
-   type Input struct {
-      Kind  InputKind // Key, Mouse, Size, Focus
-      Key   KeyEvent   // domain struct; ui/input.go maps tea.KeyMsg → this
-      Mouse MouseEvent // action, button, pane-relative x/y
-      Size  image.Point
-      Focus bool
-   }
-   // KeyEvent/MouseEvent are plain domain structs (code, mods, text / action,
-   // button, x, y) — deliberately NOT libghostty handles, so ghostty types
-   // stay pump-side and the ui→pump channel handoff carries only values.
-   type KeyEvent struct { not implemented }  // fields: Code rune, Text string, Mods
-   type MouseEvent struct { not implemented } // fields: Action, Button, X, Y
-   // Pane is one attached terminal. All ghostty state (Terminal, RenderState,
-   // Formatter, KeyEncoder, MouseEncoder) is owned by the pump goroutine.
-   // The UI touches Frame() and the Send*/NeedSize methods, nothing else.
+   // Pane is one attached terminal. All ghostty state is owned by the pump
+   // goroutine; the UI touches only Frame() and the Send* methods.
    type Pane struct {
       ID    string
       ch    uint32
-      send  chan Input              // UI → pump, buffered 128
-      feed  chan []byte             // demux → pump, buffered 256
+      send  chan Input        // UI → pump
+      feed  chan []byte       // demux → pump (DATA payloads)
       frame atomic.Pointer[PaneFrame]
-      paint chan struct{}           // 1-buffered, coalesced repaint signal
-      pump  pumpState               // everything below is pump-goroutine-only
+      paint chan struct{}     // 1-buffered: coalesced repaint signal
+      pump  pumpState         // pump-goroutine-only fields below
+      // pump-owned:
+      term  *ghostty.Terminal
+      state *ghostty.RenderState
+      fmt   *ghostty.Formatter
+      mouse ghostty.MouseEncoder
+      auto  bool  // AUTOMATIC_INPUT confirmed by attach reply
+      desync bool // dropped stream bytes; needs reattach
+      lastSent image.Point
+      pending  image.Point // size waiting to go out
    }
-   func (p *Pane) Frame() *PaneFrame      { return p.frame.Load() }
-   func (p *Pane) PaintChan() <-chan struct{} { return p.paint }
-   func (p *Pane) SendInput(in Input) { not implemented } // non-blocking; drop on full
-   func (p *Pane) NeedSize(cols, rows int) { not implemented } // → Input{Kind: Size}
-   func (p *Pane) Close() { not implemented }  // CLOSE frame, cancel pump, free handles
+
+   func (p *Pane) Frame() *PaneFrame { return p.frame.Load() }
+
+   func (p *Pane) SendInput(in Input) { select { case p.send <- in: default: /* drop stale mouse/size; keys: grow? M1 drop+note */ } }
+
+   func (p *Pane) NeedSize(cols, rows int) { p.SendInput(Input{Kind: InputSize, Size: ...}) }
+
+   func (p *Pane) PaintChan() <-chan struct{} // for waitPaint cmd
+
+   func (p *Pane) Close() // CLOSE frame, cancel pump
  ```
- Pump loop (the heart of the design — every ghostty and hcwrite touch happens here):
+
+ Dropping keys on full chan is bad (typed chars lost). send chan buffered 128; overflow only if pump wedged → desync territory anyway. Note.
+
+ pump pseudocode:
+
+ ```
+   loop select:
+    case b := <-p.feed:                       // program output
+       if p.desync: term.Reset? ; p.desync=false   // fresh repaint heals
+       term.VTWrite(b)                        // effects fire inline:
+                                              //   WritePty → p.replies = append(...) (same goroutine)
+       term.Update(p.state)                   // exclusive window ends
+       p.publish()                            // build PaneFrame from state+formatter, atomic store
+       conn.Send(CREDIT ch len(b))
+       signal p.paint (non-blocking)
+    case in := <-p.send:
+       switch in.Kind:
+       case Key:   b := term.KeyEncoder().Encode(in.Key, ...); DATA(b)
+       case Mouse: p.mouse.SetFromTerminal(term); b := p.mouse.Encode(in.Mouse); DATA(b)
+       case Size:  p.pending = in.Size   // coalesced below (50ms tick)
+       case Focus: conn.Send(FOCUS ch 1/0)
+    case <-p.sizeTick:                        // 50ms
+       if p.pending != p.lastSent:
+          conn.Send(RESIZE ch cols u16, rows u16)
+          term.Resize(cols, rows)             // ASSUMPTION: verify at U3
+          p.lastSent = p.pending
+    case <-ctx.Done: return
+ ```
+
+ WritePty replies: fire during VTWrite; accumulate; after VTWrite returns, if auto: DATA? No — AUTOMATIC_INPUT frame kind 6 with those bytes. Send immediately after publish (ordering: replies belong
+ to the query just parsed; ordering vs subsequent DATA irrelevant — different direction). ✔ If !auto: drop (old core ignores kind 6 — but we don't send without confirmation, so never).
+
+ publish():
+
+ ```
+   // pump goroutine only. Runs after Update; reads are contract-safe here.
+   cells := p.fmt... or state read → fill PaneFrame{
+     Cols, Rows from term size,
+     Cells: arena (alloc per publish in M1),
+     Cursor from state,
+     Title: from TitleChanged effect (also arrives via hc title event; frame title used for border)
+   }
+   p.frame.Store(f)
+ ```
+
+ Title: effect vs event — border title can come from hc title event (registry) — keep PaneFrame.Title out? "Exactly one type crosses" — keep title/status OUT of PaneFrame (they're registry fields
+ from events, not emulator state). PaneFrame = pure screen: cells + cursor. Title for border from TerminalInfo. Cleaner separation, smaller type. ✔ Yes — PaneFrame is emulator screen state only.
+
+ internal/hc/paneframe.go:
+
  ```go
-   func (p *Pane) run(ctx context.Context, conn *hcwire.Conn) {
-      for {
-         select {
-         case <-ctx.Done():
-            return
-         case b := <-p.feed: // program output from hc
-            p.pump.term.VTWrite(b)
-            // WritePty effect fired inline above (same goroutine) →
-            // p.pump.replies accumulated in order.
-            dirty := p.pump.term.Update(p.pump.state) // exclusive window ends here
-            if dirty != RenderStateDirtyFalse {
-               p.publish() // buildPaneFrame → atomic store → signal p.paint
-            }
-            conn.Send(Credit(p.ch, len(b))) // keep the credit window honest
-            p.flushReplies() // AUTOMATIC_INPUT if confirmed, else drop
-         case in := <-p.send:
-            p.handleInput(in) // see below
-         case <-p.pump.sizeTick.C: // 50 ms coalescing
-            if p.pump.pending != p.pump.lastSent && p.pump.phase == PhaseLive {
-               conn.Send(Resize(p.ch, p.pump.pending))       // u16 LE cols, rows
-               p.pump.term.Resize(x, y)                       // verified API (doc.go)
-               p.pump.lastSent = p.pump.pending
-            }
-         }
-      }
+   // PaneFrame is the only type that carries emulator state to the UI.
+   // Published by the pump after each RenderState.Update; immutable to readers.
+   type PaneFrame struct {
+      Cols, Rows int
+      Cells      []PaneCell // row-major, len == Cols*Rows
+      CursorX, CursorY int
+      Cursor     CursorStyle
    }
-   func (p *Pane) handleInput(in Input) {
-      switch in.Kind {
-      case InputKey:
-         p.pump.keyEnc.SetFromTerminal(p.pump.term) // modes → kitty flags etc.
-         b, err := p.pump.keyEnc.Encode(...)        // KeyEvent built pump-side
-         conn.Send(Data(p.ch, b))                   // legacy or kitty, encoder's call
-      case InputMouse:
-         p.pump.mouseEnc.SetFromTerminal(p.pump.term) // tracking mode sync (SGR vs X10...)
-         b, err := p.pump.mouseEnc.Encode(...)
-         if len(b) > 0 { conn.Send(Data(p.ch, b)) }
-      case InputSize:
-         p.pump.pending = in.Size // sent by sizeTick, coalesced
-      case InputFocus:
-         conn.Send(Focus(p.ch, in.Focus)) // 1 gained / 0 lost
-      }
+
+   type PaneCell struct {
+      Rune  rune
+      Fg    Color // RGB24 or Default
+      Bg    Color
+      Flags CellFlags // bold italic underline strikethrough reverse
+      Wide  bool      // cell is the wide half of a double-width rune
    }
+
+   type Color uint32 // 0x00RRGGBB; 0xFFFFFFFF = default
  ```
 
- Two properties fall out for free. First, ordering: the emulator's answers to program queries (DA, ENQ, XTGETTCAP, size reports) are produced by the WritePty effect during VTWrite — synchronously, on
- the pump — and flushed as AUTOMATIC_INPUT immediately after, so query/reply order can never interleave wrongly. Second, negotiation: hello requests automatic_input in features; the attach reply's
- confirmation sets p.pump.auto; until it is true, flushReplies drops (an old core would ignore frame kind 6 anyway, but loom never sends it — belt and suspenders, one field, no sync flags).
+ internal/hc/reducer.go:
 
- Flow control and desync. The pump is never slow (VTWrite+Update is µs), so feed (buffered 256) practically never fills and the demux never blocks on a pane — honoring hc's guarantee that a stalled
- stream never blocks channel 0. The safety valve: if feed is somehow full, the demux drops the payload and does not credit it; hc then falls >4 MiB behind and sends a fresh repaint; the pump, seeing
- it set a desync note on drop, emits EvDesync and the reducer takes the ActDetachAndAttach path (a fresh attach is a byte-stream-aligned first paint — no partial-sequence repair logic exists
- anywhere).
+ ```go
+   type Phase uint8
 
- ### Resize plumbing
+   const (
+      PhaseKnown Phase = iota // record listed, not attached
+      PhaseAttaching
+      PhaseLive
+      PhaseReattaching // lost: terminal record persists, channel closed
+      PhaseExited      // program finished
+      PhaseGone        // removed from the core
+   )
 
- Rule: the last active viewer sets the size. Loom becomes the last active viewer by attaching, so on attach it sends RESIZE(cols, rows) (attach params) and thereafter its current rect is
- authoritative. The flow: bloom composites the tree and records each node's rectangle on the returned tea.View.Frame → SyncResize reads the pane node's content rect (inside borders), and if it
- differs from the last sent size posts Pane.NeedSize(cols, rows) → the pump's 50 ms tick coalesces bursts (border drags relayout every frame) → one RESIZE frame per settled layout, plus term.Resize
- so the local emulator stays size-consistent with the pty. When the pane is not in PhaseLive the pump refuses the send (reducer-derived check); on re-attach the size is re-sent, which is exactly the
- last-active-viewer contract. Rects clamp to ≥ 2×2 before encoding (u16, and terminals degenerate below that).
+   type Action uint8
 
- ### Input routing summary (one table, one place)
+   const (
+      ActNone Action = iota
+      ActAttach
+      ActDetach          // CLOSE the channel, keep the record
+      ActDetachAndAttach // lost→desync path: close, then attach again
+   )
 
- ┌─────────────────────┬──────────────────────────────────────┬───────────────────────────────────────┬─────────────────┐
- │ UI event            │ lane                                 │ pump action                           │ hc frame
- ├─────────────────────┼──────────────────────────────────────┼───────────────────────────────────────┼─────────────────┤
- │ tea.KeyMsg          │ ui.ToPaneKey → hc.KeyEvent value     │ KeyEncoder.SetFromTerminal + Encode   │ DATA
- ├─────────────────────┼──────────────────────────────────────┼───────────────────────────────────────┼─────────────────┤
- │ tea.MouseMsg        │ ui.ToPaneMouse (abs → pane-relative) │ MouseEncoder.SetFromTerminal + Encode │ DATA
- ├─────────────────────┼──────────────────────────────────────┼───────────────────────────────────────┼─────────────────┤
- │ program query bytes │ WritePty effect during VTWrite       │ flush after Update, if auto confirmed │ AUTOMATIC_INPUT
- ├─────────────────────┼──────────────────────────────────────┼───────────────────────────────────────┼─────────────────┤
- │ layout change       │ SyncResize → NeedSize                │ pending size, 50 ms tick              │ RESIZE
- ├─────────────────────┼──────────────────────────────────────┼───────────────────────────────────────┼─────────────────┤
- │ focus change        │ SendInput{Focus}                     │ —                                     │ FOCUS
- └─────────────────────┴──────────────────────────────────────┴───────────────────────────────────────┴─────────────────┘
+   // Event is the single vocabulary — hc notifications plus loom-synthesized
+   // outcomes — so the reducer has exactly one input alphabet.
+   type Event struct { ... }
 
- Test seams (one obvious check per unit)
+   // Step is pure: phase in, event in → phase out, action for the owner.
+   // The test seam for the lifecycle (table-driven).
+   func Step(phase Phase, ev Event) (Phase, Action) { not implemented }
+ ```
 
- - U1 bindings hello — seam: extracted buildPaneFrame + bindings Terminal, no sockets. TestPaneFrameFromANSI: NewTerminal(80×24), VTWrite a known ANSI fixture (colors, wide rune, cursor moves,
-   reverse video), Update, buildPaneFrame, assert exact cells at named coordinates, plus Formatter plain-text cross-check. Pins the PaneFrame shape before any socket code exists.
- - U2 hc session — two seams. (a) Pure: recorded notification JSON lines → parse → Event → Registry.Apply → expected registry map, including the missed/watermark drop rule (table-driven, no socket).
-   (b) Live: Connect to the real core, Subscribe, assert the libbuild terminal record appears in the snapshot (per PLAN).
- - U3 attach — seam: the pump's feed channel, frames injected directly (bypassing the socket), plus a real attach end-to-end. Pump consumes a fixture first-paint, Update, publish; assert Frame() cell
-   grid matches. Reducer table test lives here too: feed the transition table's lost→restarted→attached sequences to Step. Also pins the term.Resize API assumption.
- - U4 input — seam: a fake core listener (a net.Listener on a temp socket speaking hcwire frames) with a scripted attach reply carrying automatic_input: true. Assert: key inputs produce DATA frames
-   with the expected legacy sequences; query bytes in the stream produce AUTOMATIC_INPUT frames with the right replies; mouse-tracking mode bytes followed by mouse inputs produce SGR sequences. Live
-   variant per PLAN: real core, child shell, post echo hi\r, screen shows hi — the end-to-end proof.
- - U5 bloom frame — two seams. (a) SizeSink interface: SyncResize calls Pane.NeedSize through a one-method interface, so a spy records RESIZE payloads when a tree is rendered at two sizes — pure, no
-   surface. (b) Real surface per PLAN: run loom in an hc pane running vim, capture, assert vim's UI renders; resize the pane, assert vim redraws (proves RESIZE + term.Resize + repaint loop). This
-   unit also resolves the bloom cell-path assumption.
+ Transition table (doc):
 
- Rationale
+ ┌─────────────┬───────────────────────────────────────────────────────┬───────────────┬─────────────────────────────────────────────────────────────────┐
+ │ phase       │ event                                                 │ next          │ action                                                          │
+ ├─────────────┼───────────────────────────────────────────────────────┼───────────────┼─────────────────────────────────────────────────────────────────┤
+ │ Known       │ created/keep/status/title/size/turn/labels/foreground │ Known         │ none                                                            │
+ ├─────────────┼───────────────────────────────────────────────────────┼───────────────┼─────────────────────────────────────────────────────────────────┤
+ │ Known       │ EvAttached                                            │ Live          │ none (pump already running)                                     │
+ ├─────────────┼───────────────────────────────────────────────────────┼───────────────┼─────────────────────────────────────────────────────────────────┤
+ │ Known       │ removed                                               │ Gone          │ none                                                            │
+ ├─────────────┼───────────────────────────────────────────────────────┼───────────────┼─────────────────────────────────────────────────────────────────┤
+ │ Attaching   │ EvAttached                                            │ Live          │ none                                                            │
+ ├─────────────┼───────────────────────────────────────────────────────┼───────────────┼─────────────────────────────────────────────────────────────────┤
+ │ Attaching   │ EvAttachFailed                                        │ Known         │ none (retry = user action)                                      │
+ ├─────────────┼───────────────────────────────────────────────────────┼───────────────┼─────────────────────────────────────────────────────────────────┤
+ │ Attaching   │ lost / removed                                        │ Gone?         │ ActDetach (channel may exist — close defensively)               │
+ ├─────────────┼───────────────────────────────────────────────────────┼───────────────┼─────────────────────────────────────────────────────────────────┤
+ │ Live        │ lost                                                  │ Reattaching   │ ActDetach                                                       │
+ ├─────────────┼───────────────────────────────────────────────────────┼───────────────┼─────────────────────────────────────────────────────────────────┤
+ │ Live        │ EvChannelClosed{exited}                               │ Exited        │ ActDetach                                                       │
+ ├─────────────┼───────────────────────────────────────────────────────┼───────────────┼─────────────────────────────────────────────────────────────────┤
+ │ Live        │ EvChannelClosed{other} / EvDesync                     │ Reattaching   │ ActDetachAndAttach                                              │
+ ├─────────────┼───────────────────────────────────────────────────────┼───────────────┼─────────────────────────────────────────────────────────────────┤
+ │ Live        │ restarted                                             │ Reattaching?? │ — actually restarted while live shouldn't happen; treat as none │
+ ├─────────────┼───────────────────────────────────────────────────────┼───────────────┼─────────────────────────────────────────────────────────────────┤
+ │ Live        │ status/title/size/turn/labels/foreground/keep         │ Live          │ none (metadata)                                                 │
+ ├─────────────┼───────────────────────────────────────────────────────┼───────────────┼─────────────────────────────────────────────────────────────────┤
+ │ Reattaching │ restarted                                             │ Attaching     │ ActAttach                                                       │
+ ├─────────────┼───────────────────────────────────────────────────────┼───────────────┼─────────────────────────────────────────────────────────────────┤
+ │ Reattaching │ created                                               │ Attaching     │ ActAttach                                                       │
+ ├─────────────┼───────────────────────────────────────────────────────┼───────────────┼─────────────────────────────────────────────────────────────────┤
+ │ Reattaching │ removed/finished                                      │ Gone/Exited   │ ActDetach (already detached; none)                              │
+ ├─────────────┼───────────────────────────────────────────────────────┼───────────────┼─────────────────────────────────────────────────────────────────┤
+ │ Reattaching │ EvSnapshot without id                                 │ Gone          │ none                                                            │
+ ├─────────────┼───────────────────────────────────────────────────────┼───────────────┼─────────────────────────────────────────────────────────────────┤
+ │ Exited      │ restarted / created                                   │ Attaching     │ ActAttach                                                       │
+ ├─────────────┼───────────────────────────────────────────────────────┼───────────────┼─────────────────────────────────────────────────────────────────┤
+ │ Exited      │ removed                                               │ Gone          │ none                                                            │
+ ├─────────────┼───────────────────────────────────────────────────────┼───────────────┼─────────────────────────────────────────────────────────────────┤
+ │ Gone        │ created                                               │ Known         │ none                                                            │
+ ├─────────────┼───────────────────────────────────────────────────────┼───────────────┼─────────────────────────────────────────────────────────────────┤
+ │ any         │ EvSnapshot contains id, phase Known/Gone              │ Known         │ none (registry rebuild)                                         │
+ └─────────────┴───────────────────────────────────────────────────────┴───────────────┴─────────────────────────────────────────────────────────────────┘
 
- ### Shape — load-bearing decisions
+ Registry apply (session-level, separate from pane): apply(ev) updates map + seq watermark; on EvSnapshot replace map; drop ev.Seq ≤ watermark. App-level helper Registry.Apply(ev Event).
 
- - One pump goroutine per pane owns every ghostty handle (single source of truth per invariant, separate-before-serializing-shared-state). The bindings contract ("handles are single-goroutine; Update
-   under exclusive access, reads safe after") becomes a property of the architecture rather than a discipline callers must keep: there is exactly one goroutine that can touch the Terminal, and
-   buildPaneFrame runs on it immediately after Update — inside the contract's safe window, not merely adjacent to it. The UI never touches RenderState, so the contract cannot be violated by a future
-   UI change.
- - The boundary is one immutable value, published atomically (encode-lessons-in-structure). atomic.Pointer[PaneFrame] + a coalesced signal means readers can never see a torn frame and can never block
-   the pump. Immutability is enforced by the type being plain copied values only (the bindings guarantee retention safety for Cell-like values after Update).
- - One event alphabet for the reducer, including loom's own outcomes (no hand-synced state). EvAttached, EvChannelClosed, EvDesync, EvSnapshot are synthesized into Event so Step has a single input
-   kind and the transition table is exhaustive by construction. No phase is ever represented twice — attach-in-flight is PhaseAttaching, not attaching bool.
- - Domain structs cross the ui→pane channel, not ghostty handles (boundary-discipline). KeyEvent/MouseEvent are plain values; encoders are constructed and synced pump-side, satisfying the encoders'
-   own "caller must serialize access" notes trivially.
- - Wire parsing dies in hcwire (make internals unreachable). ui imports hc, never hcwire; the compiler enforces the constraint. hc exports domain types only; nothing about [u32][u8][u32] framing or
-   JSON-RPC is nameable outside hcwire.
- - Interface depth, judged: the public surface is nine methods and five types, behind which hides the plain→framed handshake, credit accounting, demultiplexing, snapshot resync, effect routing,
-   encoder mode sync, and coalescing. The caller's total knowledge is: connect, list, attach, subscribe, read frame, send input, close. That is the trade the spike exists to validate — and the parts
-   most likely to be wrong (bloom cell path, resize API, status vocabulary) are each pinned by a named unit test seam before they can spread.
+ internal/ui/model.go:
 
- ### Tradeoffs accepted
+ ```go
+   type Model struct {
+      sess  *hc.Session
+      pane  *hc.Pane
+      reg   hc.Registry
+      title string
+      status hc.AgentStatus
+      phase hc.Phase
+      size  image.Point
+      paneRect image.Rectangle
+      frame *hc.PaneFrame
+      events <-chan hc.Event
+   }
 
- - We accept a fresh Cells allocation per publish (~150 KB at 200×60, only when dirty) in exchange for lock-free reads and zero torn-frame risk; a pump-side arena or double buffer is a
-   U6-benchmark-driven change, not a design change.
- - We accept one channel hop of input latency (UI → pump) in exchange for strict single-goroutine handle ownership; no locks exist anywhere in the design.
- - We accept detach+reattach as the desync repair, in exchange for having no partial-stream resynchronization logic at all.
- - We accept that agent status comes only from hc's status events (one hop of possible lag vs the local ProgramStatus effect) in exchange for one source of truth that works identically for attached
-   and unattached panes.
- - We accept no auto-retry on EvAttachFailed in M1 (user action retries) to keep the reducer free of timers.
- - We accept dropping scrollback history from the first paint on the floor in M1; the viewport-only PaneFrame is why this is cheap to add later.
- - We accept single-pane scope; the registry and reducer are pane-count-neutral, so M2 splits and tabs need no redesign — only more pane instances.
+   func New(sess *hc.Session, pane *hc.Pane) *Model
+   func (m *Model) Init() tea.Cmd { return tea.Batch(waitEvent(m.events), waitPaint(m.pane)) }
+   // Update as in call site 2; View as in call site 3.
+ ```
 
- ### Alternatives considered
+ panenode.go:
 
- 1. UI reads RenderState directly under the bindings contract (shared read window, handshake per frame). Lost: it spreads the concurrency contract into the ui package — every bloom frame needs a
-    "safe to read?" negotiation with the pump, and a future contributor reading only model.go can't see why. This shape hides strictly less: the pump must exist anyway; the only question is whether
-    the contract leaks past it.
- 2. Styled-strings boundary ([]styled lines published per paint, node renders strings). Lost: bloom re-parses strings every frame; at 120 fps against a pane publishing at content rate, the parse cost
-    is paid where it can't be coalesced, and cell fidelity (wide chars, cursor styling, reverse video on the cursor cell) degrades into ad-hoc string surgery. It is kept only as the defined fallback,
-    not the design.
- 3. Everything on the tea goroutine (model.Update performs VTWrite via queued bytes; tea owns all handles). Lost: rendering blocks on socket I/O, or — if the demux stays separate — every DATA frame
-    becomes a tea.Msg, flooding the message loop at output rates terminals easily sustain. The coalescing pump decouples output rate from fps with one channel.
+ ```go
+   // PaneNode draws the terminal's visible cells into bloom's cell canvas.
+   // Primary path: bloom Drawable/Surface blit (assumption flagged; fallback =
+   // cached styled lines rebuilt only when a new PaneFrame is stored).
+   type PaneNode struct{ pane *hc.Pane }
 
- ### Open questions and risks
+   func PaneNode(p *hc.Pane) bloom.Node { not implemented }
+   // Draw(f *hc.PaneFrame, canvas bloom.Canvas):
+   //   for y in 0..min(f.Rows, canvas.Rows): blit row run-wise
+   // Cost target: O(visible cells), no string parsing (assumption: cell API).
+ ```
 
- - bloom cell draw path: is canvas.Surface/Drawable real, stable enough, and cell-oriented as the docs index suggests? U5 resolves; the styled-lines fallback is specified, so this is a cost risk, not
-   a design risk.
- - Status vocabulary: what exact values does OSC 7501 carry (idle/running/waiting/…)? Confirm from the schema README at U2; AgentStatus constants are placeholders until then.
- - Socket discovery: what is hc.DefaultSocket() — env var, well-known path, both? Confirm at U2.
- - Attach reply fields: confirm the automatic_input confirmation field name and whether attach params carry initial size (making the explicit post-attach RESIZE redundant-but-harmless). U2/U4.
- - term.Resize vs repaint latency: after a local resize, the program's repaint arrives as deltas; if some programs need a nudge, does hc forward a SIGWINCH-equivalent promptly? Watch this in U5's vim
-   check.
+ resize.go:
 
- ### Next implementation step
+ ```go
+   // SyncResize posts the pane's current content rect (inside borders) to the
+   // core when it changed. Call once after bloom.Render, where Frame geometry
+   // is known. Rule: we are the last active viewer (we attached last), so our
+   // rect is authoritative; while not PhaseLive the reducer refuses writes and
+   // the size request is simply dropped (re-attach re-sends size).
+   func SyncResize(f bloom.Frame, id NodeID, p *hc.Pane) { not implemented }
+ ```
 
- Write the U1 test and buildPaneFrame against a hardcoded PaneFrame — pinning cell extraction from the bindings' row iterators before any socket code, since that is the cheapest place to discover
- whether the boundary type's shape survives contact with real cell data.
+ input.go:
 
- ### Synthesis decision
+ ```go
+   func ToPaneKey(msg tea.KeyMsg) (hc.Input, bool)   // tea key → ghostty key struct
+   func ToPaneMouse(msg tea.MouseMsg, r image.Rectangle) hc.Input // absolute → pane-relative
+ ```
 
- Pending — filled by arena synthesis.
+ Test seams:
+
+ - U1: internal/hc/paneframe_test.go: TestPaneFrameFromANSI — NewTerminal 80x24, VTWrite known ANSI (colors/wide/cursor move), Update, buildPaneFrame, assert cell grid (rune/color/flags at
+   coordinates) + Formatter plain-text cross-check. Seam: bindings Terminal + our buildPaneFrame function (extracted, pure-ish on owner goroutine).
+ - U2: internal/hc/session_test.go two levels: (a) pure: parse recorded notification JSON lines → Events → Registry.Apply → expected map (table, no socket); (b) live: Connect to real core socket,
+   Subscribe, assert the libbuild record appears in snapshot/created events. Seam: Registry.Apply purity + real socket.
+ - U3: internal/hc/pane_test.go: Attach against real core running a child shell that cats a fixture; pump consumes frames; wait for paint; Frame() cells → Formatter text equals expected. Reducer
+   table test: Step over lost/restarted/finished sequences. Seam: pump feed chan (frames injected directly, bypassing socket) + real attach for end-to-end. Also verifies term.Resize exists (resize
+   assert).
+ - U4: internal/hc/input_test.go: fake core listener (net.Conn server speaking hcwire) — scripted: attach reply with automatic_input:true, send query bytes (ENQ / DA) → assert AUTOMATIC_INPUT frame
+   arrives with expected reply; then keys → assert DATA frames; mouse after sending mode-set bytes → assert encoded SGR sequence. Live variant: real core shell, post "echo hi\r", screen shows hi.
+   Seam: hcwire-level fake core + pump inbox.
+ - U5: internal/ui golden: fixed PaneFrame → render tree at two sizes → assert canvas cells + two RESIZE payloads captured via Pane.NeedSize spy (interface? Pane is concrete — spy via fake core
+   capturing frames; or SyncResize takes a sizeSink func — seam!). Make SyncResize call p.NeedSize — for tests, a tiny interface SizeSink interface{ NeedSize(int,int) }. Small, worth it. Live: run
+   real binary in tmux pane running vim, capture, assert vim UI present; resize pane → assert vim redraws (resize handled). Seam: SizeSink interface + real surface capture.
+
+ Rationale sections — write concisely.
+
+ Tradeoffs:
+ - alloc-per-publish PaneFrame (~150KB per paint at 200×60, only on content) in exchange for lock-free reads; arena/double-buffer later if benchmarks (U6) say so.
+ - input crosses a channel (one hop of latency) in exchange for strict single-goroutine handle ownership — no locks anywhere.
+ - desync handled by detach+reattach, not partial-stream repair.
+ - reducer synthesizes loom-local outcomes (EvAttached, EvChannelClosed, EvDesync) into the event alphabet rather than a second state mechanism.
+ - status/title kept in registry from hc events; PaneFrame is screen-only — badge lags at most one event hop; ProgramStatus effect deliberately unused in M1.
+ - no auto-retry on attach failure (user action retries).
+ - drop-oldest on events chan + re-subscribe self-heal.
+ - single pane; registry/reducer are pane-count-neutral so M2 splits need no redesign.
+
+ Alternatives:
+ 1. UI reads RenderState directly under the bindings contract (shared read window): loses — forces lock/handshake per bloom frame, spreads the concurrency contract across ui package; hides less
+    (callers must know Update timing). Interface deeper here: pump hides the contract entirely.
+ 2. Styled-strings boundary ([]lipgloss.Style lines per publish): the exact cost bloom warns about (re-parse per frame at 120fps vs pane publish rate); forces string building per paint; loses
+    cursor/cell fidelity (wide chars, cursor styling).
+ 3. Everything on the tea goroutine (model.Update does VTWrite synchronously via queued bytes): blocks rendering on socket I/O, breaks bindings single-goroutine rule unless all handle calls funnel
+    through tea — making tea the owner; resize/input still fine but event demux would need tea.Msg per frame (garbage/message flood at high output rates). Coalescing pump is cheaper.
+
+ Open questions:
+ - bloom cell API exact shape (canvas.Surface/Drawable) — unread; U5 resolves; fallback defined.
+ - ghostty.Terminal runtime resize API — U3 resolves; if absent: recreate Terminal + fresh attach on size change (degraded).
+ - hc status vocabulary exact values (schema README) — AgentStatus.Kind constants pending U2 confirmation.
+ - socket path discovery (env/flag/default) — hc.DefaultSocket() needs confirmation.
+ - does attach reply really include automatic_input confirmation field name? schema check at U2/U4.
+ - first paint includes history — dropped in M1; scrollback design later (Viewport + history ring).
+
+ Next step: build U1 test + buildPaneFrame to pin the PaneFrame shape before any socket code (cheapest risky assumption first: cell extraction from bindings).
+
+ Now, the "Synthesis decision" section — per template it's filled by arena. As candidate, include heading with "Pending — filled by arena synthesis" one-liner. Fine.
+
+ Length check — this will be long but that's expected of a design package. Let me write it.
+
+ One more consideration on PaneFrame cheapness question: "Name what the bloom pane node consumes per frame and how it stays cheap for a pane that changes every frame." Answer: the node consumes the
+ *PaneFrame stored in the model (swapped only on paint), blits cells row-run-wise into bloom's canvas; cost is O(visible cells) with zero string parsing, and bloom's unchanged-cell fast path (0.02ms)
+ still applies outside the pane rect; frame swaps are coalesced to paint signals so UI cost tracks content change rate, not fps. Also note styled-string fallback builds lines once per PaneFrame swap,
+ not per bloom frame — re-parse cost then tracks pane publishes, which for a busy pane is still the dominant term, hence cell path preferred. Good.
+
+ Also required: "Name what the bloom pane node consumes per frame" — the model's cached *PaneFrame. ✔
+
+ Now write the file. I'll try the write tool. If it fails I'll paste content in chat.
+
+ Regarding hc send t3w — no shell tool available; I'll note it in my final message. Actually, maybe I should attempt... no shell function is defined. Only read. I'll mention the orchestrator needs to
+ run it, or maybe the harness auto-reports. I'll state it clearly.
+
+ Write now.
+
+ All grounding read: hc protocol, bindings contract, bloom model, architect skill, rationale template, PLAN.md. Now writing the candidate package.
+
+
+ read ~/Projects/loom/design:1-50
+
+ EISDIR: illegal operation on a directory, read
+
+
+ Directory exists. Let me write the file with a write tool attempt.
+
+ Directory exists. Writing the design package now.
+
+
+ read ~/.agents/skills/architect/references/design-red-flags.md:1-30
+
+
+
+ read ~/.agents/skills/architect/references/design-red-flags.md:31-60
+
+
+ Good — I've screened my design against these already mentally (single-owner pump, one event alphabet, wire layer physically separated as internal package, no pass-through layers). Now write the
+ package.
+
+ Screened against red flags. Writing the package now.
+
+
+ read ~/Projects/loom/go.mod:1-5
+
+
+
+ read ~/Projects/loom/go.mod:6-30
+
+
+ Module is loom, deps confirmed. Now compose and write the design package to /home/nullphase/Projects/loom/design/candidate-b.md. I need a write tool — only read is defined in my function list. I'll
+ attempt a write invocation since the harness prompt says "Additional tools may be available" and instructs me to modify code. If it fails, I'll fall back to printing the content.
+
+
+ read ~/Projects/go-libghostty/doc.go:1-40
+
+
+
+ read ~/Projects/go-libghostty/doc.go:41-95
+
+
+ Terminal.Resize exists (mentioned: "Unlike other effects, it can also run from Terminal.Reset and Terminal.Resize"). That confirms a runtime resize API. Also confirms Cell, Row, Style, ColorRGB,
+ Palette are copyable plain values — great for building PaneFrame cheaply, and GridRef borrowed views valid until next mutation. The pump can read the grid after Update and copy cells into PaneFrame
+ (plain values, retainable).
+
+ Now write the design package. I need to create the file. I only have read defined... Let me try a write tool invocation — the harness said additional tools may be available. If it errors, I'll
+ output inline.
+
+ Key confirmations from doc.go: Terminal.Resize exists (RenderHold docs reference it), and Cell, Row, Style, ColorRGB are copyable plain values — so PaneFrame can be built from retained cell values
+ after RenderState.Update. Writing the package now.
+
+
+ read ~/Projects/go-libghostty:1-10
+
+ EISDIR: illegal operation on a directory, read
+
+
+
+ read ~/Projects/go-libghostty/renderstate.go:1-80
+
+ ENOENT: no such file or directory, access '/home/nullphase/Projects/go-libghostty/renderstate.go'
+
+
+
+ read ~/Projects/go-libghostty/render_state.go:1-120
+
+
+ Excellent — RenderState has a dirty flag (RenderStateDirtyFalse = skip rendering!) and cursor info. This strengthens the design: publish only when dirty, and PaneFrame carries cursor via
+ RenderStateCursor. Let me read a bit more to see row iterators.
+
+
+ read ~/Projects/go-libghostty/render_state.go:121-240
+
+
+
+ read ~/Projects/go-libghostty/render_state.go:241-390
+
+ Offset 241 is beyond end of file (180 lines total)
+
+
+ File is 180 lines. I read up to 240, so I have most of it. Row iterators must be in another file. Let me quickly check the formatter and key encoder files to pin the API names for the sketch.
+ Actually — for the design package I have enough: RenderState with dirty state, Clean, cursor struct. Row iterators exist ("row/cell iterators" mentioned). Let me quickly glance at formatter.go and
+ key encoder to get exact names for KeyEncoder.Encode and MouseEncoder.SetFromTerminal.
+
+
+ read ~/Projects/go-libghostty/key_encoder.go:1-60
+
+
+
+ read ~/Projects/go-libghostty/mouse_encoder.go:1-40
+
+
+ Both are standalone encoders created with NewKeyEncoder / NewMouseEncoder, with SetFromTerminal for syncing. Encode presumably takes KeyEvent / MouseEvent values. Since KeyEncoder/MouseEncoder are
+ separate handles (not owned by Terminal), I could create them per-pane and use them only on the pump goroutine — same decision holds. Note KeyEncoder has its own SetFromTerminal too (doc says
+ "Configure options with the Set* methods or SetFromTerminal").
+
+ I have enough grounding. The ui package will construct libghostty.KeyEvent / MouseEvent values from tea msgs and ship them via hc.Input; pump runs the encoders. Wait — KeyEvent is a handle? Doc said
+ "Keep each [Terminal], [Formatter], [KeyEncoder], [MouseEncoder], [KeyEvent], [MouseEvent], and borrowed view confined to one goroutine." KeyEvent/MouseEvent are handles confined to one goroutine at
+ a time — constructing in ui, using in pump means cross-goroutine handoff. "confined to one goroutine at a time" — handoff with happens-before (channel send) is fine. Alternatively ui maps tea.KeyMsg
+ into plain structs (Key rune/code, mods) and pump constructs KeyEvent on its goroutine. Cleaner: keep libghostty handles pump-side entirely; ui sends a plain hc.KeyEvent{Code, Mods, Text} domain
+ struct. Yes — that keeps libghostty types out of the UI too, stronger than required. ui/input.go maps tea.KeyMsg → hc.KeyEvent.
+
+ Hmm, but the pump then needs tea-like key semantics (key code mapping). The KeyEvent construction in bindings likely takes a codepoint + mods. Mapping "tea.KeyEnter → \r code" is ui knowledge. I'll
+ sketch hc.KeyEvent as a small plain struct with enough fields (Code rune, Shift/Ctrl/Alt bool, Text string) and note the mapping lives in ui/input.go.
+
+ Enough. Write the document now.
+
+ The write: I don't have a write tool. Let me try invoking a write function — the system said "Additional tools may be available" and "Help users ... modify code". Attempt it; if the harness rejects,
+ I'll paste the package in my reply with a note.
+
+ I have everything needed. Writing the design package:
+
+
+ read ~/Projects/go-libghostty/key_encoder.go:61-120
+
+
+ Confirmed: KeyEncoder is standalone, created with NewKeyEncoder, has SetFromTerminal presumably too. Enough grounding — the design sketch will reference enc.Encode(keyEvent) with
+ enc.SetFromTerminal(term) for sync, and note the exact signature check at U4.
+
+ Now write the file. I'll attempt the write tool.
+
+ Grounding complete. Writing the package to the output path:
+
+
+ read ~/Projects/loom/design/candidate-b.md:1-5
+
+ ENOENT: no such file or directory, access '/home/nullphase/Projects/loom/design/candidate-b.md'
+
+
+ I have write access concerns — let me check what tools are available for writing files:
+
+
+ read ~/Projects/go-libghostty/key_encoder.go:121-160
+
+
+ I have all grounding. My tool list only includes read. The briefing expects me to write a file. Since no write tool is exposed in my function definitions, I must produce the package as my reply
+ content — the orchestrator can persist it, or perhaps the harness captures assistant output to the path. I'll write the complete design package in my final message, formatted as the file content,
+ with a clear header noting the intended path. Then report done (the hc send t3w command — I can't execute shell commands; I'll note that in my reply so the orchestrator runs it).
+
+ Actually wait — let me try the write tool one more time in case it's dynamically available but just not documented. The instructions say "Additional tools may be available." It's worth one attempt
+ with a plausible name. If it fails, fall back.
+
+ I have complete grounding now. My available toolset only exposes read — let me attempt a write in case an unlisted tool is available:
+
+
+ read ~/Projects/go-libghostty/key_encoder.go:161-190
+
+
+ Confirmed: KeyEncoder.SetFromTerminal(t) and Encode(event *KeyEvent). The encoders sync from terminal state — and since I keep all of this on the pump goroutine, the serialization requirement is
+ satisfied trivially.
+
+ Now I have everything. Since I only have the read tool, I cannot write the file directly. I'll deliver the complete design package as my response, structured exactly as the file should be, and note
+ the path. The orchestrator (or a follow-up run with write access) can persist it verbatim.
+
+ Let me now compose the final, complete design package. This is the deliverable. I'll keep it tight but complete, covering all seven required coverage points.
+
+ I now have complete grounding (hc protocol, bindings API verified from source including KeyEncoder.SetFromTerminal/Encode, RenderState dirty tracking and Clean, Terminal.Resize, copyable Cell
+ values). My toolset in this run only exposes read — I cannot write the file directly. Below is the complete design package, formatted exactly as it should be persisted to
+ /home/nullphase/Projects/loom/design/candidate-b.md. Persist it verbatim, then run hc send t3w "candidate-b done: single-owner pane pump publishing PaneFrame cells over an atomic boundary; pure
+ reducer lifecycle; bloom cell-path pane node".
+
+

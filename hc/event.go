@@ -69,9 +69,9 @@ func (p eventNoteParams) TerminalID() TerminalID { return TerminalID(p.Terminal)
 // eventSnapshotJSON is the missed notification's fresh snapshot shape; it
 // matches the events.subscribe reply body too.
 type eventSnapshotJSON struct {
-	Seq       uint64            `json:"seq"`
-	Terminals []terminalRecord  `json:"terminals"`
-	Channel   uint32            `json:"channel"`
+	Seq       uint64           `json:"seq"`
+	Terminals []terminalRecord `json:"terminals"`
+	Channel   uint32           `json:"channel"`
 }
 
 type eventFeed struct {
@@ -198,15 +198,15 @@ func mapEvent(p eventNoteParams) []Event {
 
 // Terminal record subset the sidebar and pane need; hc records carry far more.
 type terminalRecord struct {
-	Address string              `json:"address"`
-	Title   string              `json:"title"`
-	Cols    uint16              `json:"cols"`
-	Rows    uint16              `json:"rows"`
-	Labels  map[string]string   `json:"labels"`
-	Status  *statusRecord       `json:"status"`
-	State   string              `json:"state"`
-	Reason  string              `json:"reason"`
-	ExitCode *int32             `json:"exit_code"`
+	Address  string            `json:"address"`
+	Title    string            `json:"title"`
+	Cols     uint16            `json:"cols"`
+	Rows     uint16            `json:"rows"`
+	Labels   map[string]string `json:"labels"`
+	Status   *statusRecord     `json:"status"`
+	State    string            `json:"state"`
+	Reason   string            `json:"reason"`
+	ExitCode *int32            `json:"exit_code"`
 }
 
 type statusRecord struct {

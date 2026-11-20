@@ -47,17 +47,17 @@ func (s State) String() string {
 type Change uint8
 
 const (
-	ChangeAttach Change = iota // the viewer asked to attach
-	ChangeAttachOK             // attach reply confirmed the stream
-	ChangeAttachFail           // attach refused (finished, not_found, unavailable, ...)
-	ChangeCloseExited          // CLOSE with reason "exited"
-	ChangeCloseDetached        // empty CLOSE (detach ack)
-	ChangeCloseLost            // CLOSE with a loss reason (signaled, holder_lost, ...)
-	ChangeLost                 // hc lost event
-	ChangeRestarted            // hc restarted event
-	ChangeFinished             // hc finished event
-	ChangeRemoved              // hc removed event
-	ChangeCreated              // hc created event: fresh incarnation after gone
+	ChangeAttach        Change = iota // the viewer asked to attach
+	ChangeAttachOK                    // attach reply confirmed the stream
+	ChangeAttachFail                  // attach refused (finished, not_found, unavailable, ...)
+	ChangeCloseExited                 // CLOSE with reason "exited"
+	ChangeCloseDetached               // empty CLOSE (detach ack)
+	ChangeCloseLost                   // CLOSE with a loss reason (signaled, holder_lost, ...)
+	ChangeLost                        // hc lost event
+	ChangeRestarted                   // hc restarted event
+	ChangeFinished                    // hc finished event
+	ChangeRemoved                     // hc removed event
+	ChangeCreated                     // hc created event: fresh incarnation after gone
 )
 
 // Effect is an action the machine wants executed; the pane runs them on the
@@ -118,6 +118,10 @@ func advance(st State, ch Change) (State, []Effect) {
 			return StateGone, nil
 		case ChangeCreated:
 			return StateIdle, nil
+		case ChangeAttach:
+			// Attach on a finished record fails with kind "finished"; the
+			// attempt is allowed (candidate A's shape) and fails back to idle.
+			return StateAttaching, []Effect{EffAttach}
 		}
 	case StateLostIdle:
 		switch ch {

@@ -40,6 +40,7 @@ func TestAdvanceTable(t *testing.T) {
 		{"lostIdle finished", StateLostIdle, ChangeFinished, StateExited, nil},
 		{"exited removed", StateExited, ChangeRemoved, StateGone, nil},
 		{"exited created", StateExited, ChangeCreated, StateIdle, nil},
+		{"exited attach attempt", StateExited, ChangeAttach, StateAttaching, []Effect{EffAttach}},
 		{"gone created", StateGone, ChangeCreated, StateIdle, nil},
 		{"gone attach no-op", StateGone, ChangeAttach, StateGone, nil},
 		{"attached stray attach no-op", StateAttached, ChangeAttach, StateAttached, nil},

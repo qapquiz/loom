@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 type Features struct{ AutomaticInput bool }
@@ -73,6 +74,7 @@ type Session struct {
 	br   *bufio.Reader
 
 	writeMu sync.Mutex
+	work    chan func() // closures for the read-loop goroutine (Session.Do)
 
 	mu      sync.Mutex
 	pending map[uint64]*pendingCall
@@ -138,6 +140,7 @@ func DialConn(conn net.Conn, f Features) (*Session, error) {
 	s := &Session{
 		conn:      conn,
 		br:        br,
+		work:      make(chan func(), 1024),
 		pending:   map[uint64]*pendingCall{},
 		streams:   map[uint32]*streamState{},
 		helloAuto: f.AutomaticInput && hasFeature(hello.Features, "automatic_input"),
@@ -171,6 +174,12 @@ func DialConn(conn net.Conn, f Features) (*Session, error) {
 func (s *Session) Events() <-chan Event {
 	return s.evCh
 }
+
+// Do runs fn on the read-loop goroutine between frames — the enqueue-only
+// UI→session path the pane's op/machine queue rides. Fire-and-forget: dropped
+// when the queue is full (UI-rate work only). The read loop drains the queue
+// before each blocking read and re-checks on a short read deadline, so queued
+// work runs even when no traffic is flowing (idle keystrokes included).
 
 // Attach enqueues terminal.attach on the events-free channel 0; the result
 // arrives via in.Connected / in.Closed on the read-loop goroutine.
@@ -266,10 +275,17 @@ func (s *Session) send(method string, params any, fn func(rpcResult)) (*pendingC
 
 // --- read loop ---
 
+// readLoop: the session goroutine. Owns the socket reader, frame demux, RPC
+// correlation, credit, stream callbacks, and Do closures.
 func (s *Session) readLoop() {
 	for {
+		s.drainWork()
+		s.conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
 		f, err := readFrame(s.br)
 		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				continue
+			}
 			break
 		}
 		if !s.dispatch(f) {
@@ -277,6 +293,17 @@ func (s *Session) readLoop() {
 		}
 	}
 	s.teardown()
+}
+
+func (s *Session) drainWork() {
+	for {
+		select {
+		case fn := <-s.work:
+			fn()
+		default:
+			return
+		}
+	}
 }
 
 // dispatch returns false when the session is over (channel-0 CLOSE).
@@ -389,6 +416,13 @@ func (s *Session) credit(ch uint32, n int) {
 func (s *Session) deliver(evs ...Event) {
 	for _, ev := range evs {
 		s.evCh <- ev
+	}
+}
+
+func (s *Session) Do(fn func()) {
+	select {
+	case s.work <- fn:
+	default:
 	}
 }
 

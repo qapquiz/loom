@@ -6,6 +6,8 @@ package hc
 import (
 	"bytes"
 	"encoding/binary"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -55,32 +57,52 @@ func TestDialPlainToFramedHandshake(t *testing.T) {
 }
 
 type recorder struct {
-	connected bool
-	autoInput bool
-	out       StreamOut
+	connected atomic.Bool
+	autoInput atomic.Bool
+	out       atomic.Pointer[streamOutStub]
+	deltasMu  sync.Mutex
 	deltas    [][]byte
+	closedMu  sync.Mutex
 	closed    []CloseReason
 }
 
-func (r *recorder) Connected(out StreamOut, autoInput bool) {
-	r.connected = true
-	r.autoInput = autoInput
-	r.out = out
+// streamOutStub records the write half the session handed over. Methods pass
+// straight through to the real streamOut; only the pointer is stubbed.
+type streamOutStub struct {
+	StreamOut
 }
 
-func (r *recorder) Delta(p []byte) { r.deltas = append(r.deltas, bytes.Clone(p)) }
+func (r *recorder) Connected(out StreamOut, autoInput bool) {
+	r.connected.Store(true)
+	r.autoInput.Store(autoInput)
+	r.out.Store(&streamOutStub{out})
+}
 
-func (r *recorder) Closed(reason CloseReason) { r.closed = append(r.closed, reason) }
+func (r *recorder) Delta(p []byte) {
+	r.deltasMu.Lock()
+	r.deltas = append(r.deltas, bytes.Clone(p))
+	r.deltasMu.Unlock()
+}
+
+func (r *recorder) Closed(reason CloseReason) {
+	r.closedMu.Lock()
+	r.closed = append(r.closed, reason)
+	r.closedMu.Unlock()
+}
+
+func (r *recorder) Out() StreamOut { return r.out.Load() }
+
+func (r *recorder) reasons() []CloseReason {
+	r.closedMu.Lock()
+	defer r.closedMu.Unlock()
+	return append([]CloseReason(nil), r.closed...)
+}
 
 func attachRecorder(t *testing.T, sess *Session) *recorder {
 	t.Helper()
 	rec := &recorder{}
 	sess.Attach("t7", rec)
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) && !rec.connected {
-		time.Sleep(2 * time.Millisecond)
-	}
-	if !rec.connected {
+	if !waitUntil(2*time.Second, func() bool { return rec.connected.Load() }) {
 		t.Fatal("attach never confirmed")
 	}
 	return rec
@@ -95,21 +117,21 @@ func TestAttachKeysAsDataAndCredit(t *testing.T) {
 	}
 	defer sess.Close()
 	rec := attachRecorder(t, sess)
-	if !rec.autoInput {
+	if !rec.autoInput.Load() {
 		t.Fatal("autoInput not negotiated though core confirmed it")
 	}
 
 	// First paint arrives as DATA and is credited after the callback returns.
 	core.Delta([]byte("hello \x1b[1mloom\x1b[0m"))
-	if !waitUntil(2*time.Second, func() bool { return len(rec.deltas) > 0 }) {
+	if !waitUntil(2*time.Second, func() bool { return rec.firstDelta() != nil }) {
 		t.Fatal("first paint never delivered")
 	}
-	if !core.Has(creditFrame(7, len(rec.deltas[0]))) {
+	if !core.Has(creditFrame(7, len(rec.firstDelta()))) {
 		t.Fatal("no CREDIT matching consumed first-paint bytes")
 	}
 
 	// Keys go out as DATA on the stream channel.
-	rec.out.Send([]byte("echo loom\r"))
+	rec.Out().Send([]byte("echo loom\r"))
 	if !waitUntil(2*time.Second, func() bool {
 		return core.Has(func(f testcore.Frame) bool {
 			return f.Kind == 0 && f.Ch == 7 && bytes.Contains(f.Payload, []byte("echo loom\r"))
@@ -119,8 +141,8 @@ func TestAttachKeysAsDataAndCredit(t *testing.T) {
 	}
 
 	// Resize and Focus frame payloads per the schema.
-	rec.out.Resize(120, 40)
-	rec.out.Focus(true)
+	rec.Out().Resize(120, 40)
+	rec.Out().Focus(true)
 	if !waitUntil(2*time.Second, func() bool {
 		return core.Has(func(f testcore.Frame) bool { return f.Kind == 3 && f.Ch == 7 })
 	}) {
@@ -153,10 +175,10 @@ func TestAutoInputGatedOnNegotiation(t *testing.T) {
 	}
 	defer sessNo.Close()
 	recNo := attachRecorder(t, sessNo)
-	if recNo.autoInput {
+	if recNo.autoInput.Load() {
 		t.Fatal("autoInput negotiated without confirmation")
 	}
-	recNo.out.AutoReply([]byte("\x1b[?1;2c"))
+	recNo.Out().AutoReply([]byte("\x1b[?1;2c"))
 	if !waitUntil(300*time.Millisecond, func() bool { return len(refused.Frames()) > 0 }) {
 		t.Fatal("connection dead")
 	}
@@ -174,10 +196,10 @@ func TestAutoInputGatedOnNegotiation(t *testing.T) {
 	}
 	defer sessYes.Close()
 	recYes := attachRecorder(t, sessYes)
-	if !recYes.autoInput {
+	if !recYes.autoInput.Load() {
 		t.Fatal("autoInput not negotiated though core confirmed it")
 	}
-	recYes.out.AutoReply([]byte("\x1b[?1;2c"))
+	recYes.Out().AutoReply([]byte("\x1b[?1;2c"))
 	if !waitUntil(2*time.Second, func() bool {
 		return granted.Has(func(f testcore.Frame) bool {
 			return f.Kind == 6 && bytes.Equal(f.Payload, []byte("\x1b[?1;2c"))
@@ -198,9 +220,9 @@ func TestAttachRefusalClosesStream(t *testing.T) {
 	rec := &recorder{}
 	sess.Attach("t7", rec)
 	if !waitUntil(2*time.Second, func() bool {
-		return len(rec.closed) > 0 && rec.closed[0].Reason == "attach_failed"
+		return len(rec.reasons()) > 0 && rec.reasons()[0].Reason == "attach_failed"
 	}) {
-		t.Fatalf("attach refusal not surfaced: %+v", rec.closed)
+		t.Fatalf("attach refusal not surfaced: %+v", rec.reasons())
 	}
 }
 
@@ -214,20 +236,20 @@ func TestStreamCloseReasons(t *testing.T) {
 	rec := attachRecorder(t, sess)
 
 	core.CloseStream(`{"reason":"exited","exit_code":3,"signal":null}`)
-	if !waitUntil(2*time.Second, func() bool { return len(rec.closed) > 0 }) {
+	if !waitUntil(2*time.Second, func() bool { return len(rec.reasons()) > 0 }) {
 		t.Fatal("CLOSE never delivered")
 	}
-	if got := rec.closed[0]; got.Reason != "exited" || got.ExitCode != 3 {
+	if got := rec.reasons()[0]; got.Reason != "exited" || got.ExitCode != 3 {
 		t.Fatalf("close reason = %+v", got)
 	}
 
 	// Detach: viewer CLOSE then empty CLOSE ack from the core.
 	rec2 := attachRecorder(t, sess)
-	rec2.out.Close()
+	rec2.Out().Close()
 	if !waitUntil(2*time.Second, func() bool {
-		return len(rec2.closed) > 0 && rec2.closed[0].Reason == "detached"
+		return len(rec2.reasons()) > 0 && rec2.reasons()[0].Reason == "detached"
 	}) {
-		t.Fatalf("detach ack not surfaced: %+v", rec2.closed)
+		t.Fatalf("detach ack not surfaced: %+v", rec2.reasons())
 	}
 }
 
@@ -246,4 +268,13 @@ func waitUntil(d time.Duration, fn func() bool) bool {
 		time.Sleep(2 * time.Millisecond)
 	}
 	return fn()
+}
+
+func (r *recorder) firstDelta() []byte {
+	r.deltasMu.Lock()
+	defer r.deltasMu.Unlock()
+	if len(r.deltas) == 0 {
+		return nil
+	}
+	return r.deltas[0]
 }

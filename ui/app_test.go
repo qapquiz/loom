@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"bytes"
 	"encoding/json"
 	"reflect"
 	"testing"
@@ -162,27 +163,25 @@ func TestAppMouseDroppedWhenProgramDoesNotOwnIt(t *testing.T) {
 	}
 }
 
-// The app boundary owns pane-relative cell mapping; the wire check lives
-// here too but only proves the drop path, because the pane-side encoder
-// needs a size context before it emits bytes (reported to the orchestrator).
 func TestAppMouseRoutingBoundary(t *testing.T) {
 	c, a := newApp(t, `[{"address":"t7","title":"vim","cols":80,"rows":24}]`)
 	if !waitForPhase(t, a.pane, 2*time.Second, pane.StateAttached) {
 		t.Fatal("no attach")
 	}
 	a.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
-	c.Delta([]byte("\x1b[?1000h"))
+	c.Delta([]byte("\x1b[?1000h\x1b[?1006h"))
 	waitMouseOn(t, a)
 	a.View()
 	r, ok := a.ui.Frame().Rect(paneRect)
 	if !ok || r.Min.X != sidebarWidth {
 		t.Fatalf("pane rect = %v ok=%v", r, ok)
 	}
-	// Screen (25,3) over a rect starting at x=20 is pane cell (5,3).
-	op := mouseToOp(tea.MouseClickMsg{X: 25, Y: 3, Button: tea.MouseLeft}, 25-r.Min.X, 3-r.Min.Y)
-	if op.Mouse.Col != 5 || op.Mouse.Row != 3 {
-		t.Fatalf("pane-relative cells = %d,%d", op.Mouse.Col, op.Mouse.Row)
-	}
+	// Screen (25,3) over a rect starting at x=20 is pane cell (5,3); SGR is
+	// 1-based, so the wire sequence must carry 6;4.
+	a.Update(tea.MouseClickMsg{X: 25, Y: 3, Button: tea.MouseLeft})
+	waitForFrame(t, c, 2*time.Second, func(f testcore.Frame) bool {
+		return f.Kind == 0 && f.Ch == 7 && bytes.Contains(f.Payload, []byte("\x1b[<0;6;4M"))
+	})
 }
 
 func TestAppEventSizeFollowedWhilePassive(t *testing.T) {

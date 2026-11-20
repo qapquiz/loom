@@ -1,6 +1,8 @@
 package ui
 
 import (
+	"os"
+
 	tea "charm.land/bubbletea/v2"
 
 	"bloomfx.dev/bloom"
@@ -145,21 +147,41 @@ func (a *App) onEvent(ev hc.Event) {
 }
 
 func (a *App) attachFirst() {
-	for _, t := range a.room.Terminals() {
-		if t.State != room.Listed {
-			continue
-		}
-		p := pane.New(t.ID, a.notify)
-		p.SetPump(a.sess.Do)
-		p.SetAttachFn(func() { a.sess.Attach(t.ID, p) })
-		a.pane = p
-		a.node = NewPaneNode(p)
-		a.active = t.ID
-		a.sentW, a.sentH = 0, 0
-		a.paneLiveSeen = false
-		p.Change(pane.ChangeAttach)
+	id := pickAttach(&a.room, os.Getenv("LOOM_ATTACH"))
+	if id == "" {
 		return
 	}
+	p := pane.New(id, a.notify)
+	p.SetPump(a.sess.Do)
+	p.SetAttachFn(func() { a.sess.Attach(id, p) })
+	a.pane = p
+	a.node = NewPaneNode(p)
+	a.active = id
+	a.sentW, a.sentH = 0, 0
+	a.paneLiveSeen = false
+	p.Change(pane.ChangeAttach)
+}
+
+// pickAttach chooses the auto-attach target: LOOM_ATTACH by terminal id or
+// title when set and present, else the first Listed. A set target that has
+// not appeared yet returns empty, so loom waits instead of attaching an
+// unrelated terminal; a later snapshot re-runs the pick.
+func pickAttach(r *room.Room, want string) hc.TerminalID {
+	ts := r.Terminals()
+	if want != "" {
+		for _, t := range ts {
+			if t.State == room.Listed && (string(t.ID) == want || t.Info.Title == want) {
+				return t.ID
+			}
+		}
+		return ""
+	}
+	for _, t := range ts {
+		if t.State == room.Listed {
+			return t.ID
+		}
+	}
+	return ""
 }
 
 func (a *App) paneChange(ch pane.Change) {

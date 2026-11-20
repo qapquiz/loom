@@ -1,6 +1,7 @@
 // Command loom attaches to an hc core and renders one terminal on a bloom
 // tree. Socket discovery follows hc: HC_SOCKET, HC_TERMINAL_SOCKET, then the
-// XDG runtime/state paths.
+// XDG runtime/state paths. LOOM_ATTACH pins the auto-attach target by
+// terminal id or title; unset attaches the first listed.
 package main
 
 import (

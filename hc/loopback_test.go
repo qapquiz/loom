@@ -148,7 +148,10 @@ func TestAttachKeysAsDataAndCredit(t *testing.T) {
 	}) {
 		t.Fatal("resize never arrived")
 	}
-	if !core.Has(func(f testcore.Frame) bool { return f.Kind == 4 && f.Ch == 7 }) {
+	// FOCUS races the RESIZE frame on the core's reader; wait the same way.
+	if !waitUntil(2*time.Second, func() bool {
+		return core.Has(func(f testcore.Frame) bool { return f.Kind == 4 && f.Ch == 7 })
+	}) {
 		t.Fatal("focus never arrived")
 	}
 	for _, f := range core.Frames() {

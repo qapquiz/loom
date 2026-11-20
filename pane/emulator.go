@@ -172,6 +172,18 @@ func (p *Pane) publish() {
 	if err != nil {
 		return
 	}
+	// Synthetic 1x1 px cells: headless loom has no pixel geometry and M1
+	// negotiates no FACTS, but the encoder refuses to emit anything without
+	// a non-zero cell size. At 1x1 the pane's cell-coord positions divide
+	// out to themselves, so cell-based protocols (X10, SGR, URxvt) encode
+	// correctly; only SGR-pixels stays approximate, which is the M1
+	// posture for anything pixel-denominated.
+	e.mouseEnc.SetSize(libghostty.MouseEncoderSize{
+		ScreenWidth:  uint32(cols),
+		ScreenHeight: uint32(rows),
+		CellWidth:    1,
+		CellHeight:   1,
+	})
 	screen := &Screen{
 		Cols:   int(cols),
 		Rows:   int(rows),

@@ -160,6 +160,11 @@ func (a *App) attachFirst() {
 	a.sentW, a.sentH = 0, 0
 	a.paneLiveSeen = false
 	p.Change(pane.ChangeAttach)
+	// The initial WindowSizeMsg usually predates the snapshot, so re-post
+	// the stored size here: OpResize records want while not live, and
+	// Connected's reconcile imposes it (the pane's own idempotence keeps
+	// this an echo, not a fight).
+	a.postSize(a.width, a.height)
 }
 
 // pickAttach chooses the auto-attach target: LOOM_ATTACH by terminal id or

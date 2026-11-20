@@ -224,3 +224,26 @@ func TestAppQuitsWhenSessionCloses(t *testing.T) {
 		t.Fatalf("session close yields %v, want quitMsg", got)
 	}
 }
+
+// The real surface delivers WindowSizeMsg before the snapshot event; the
+// recorded size must reach the stream as RESIZE once the attach confirms.
+func TestAppResizeWhenWindowSizePrecedesAttach(t *testing.T) {
+	core := testcore.Serve(t)
+	core.Terminals = `[{"address":"t7","title":"vim","cols":80,"rows":24}]`
+	sess, err := hc.Dial(core.SocketPath(), hc.Features{})
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	t.Cleanup(func() { sess.Close() })
+	a := New(sess)
+
+	a.Update(tea.WindowSizeMsg{Width: 100, Height: 30}) // pane still nil here
+	a.Update(eventMsg{<-sess.Events()})
+	if !waitForPhase(t, a.pane, 2*time.Second, pane.StateAttached) {
+		t.Fatalf("phase = %v", a.pane.Phase())
+	}
+	waitForFrame(t, core, 2*time.Second, func(f testcore.Frame) bool {
+		return f.Kind == 3 && f.Ch == 7 && len(f.Payload) == 4 &&
+			f.Payload[0] == 80 && f.Payload[2] == 30
+	})
+}

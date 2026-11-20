@@ -20,7 +20,7 @@ func sidebar(r *room.Room, active hc.TerminalID) string {
 	for _, t := range ts {
 		mark := "  "
 		if t.ID == active {
-			mark = "▸ "
+			mark = "› " // herdr's own cursor glyph
 		}
 		title := t.Info.Title
 		if title == "" {
@@ -28,7 +28,7 @@ func sidebar(r *room.Room, active hc.TerminalID) string {
 		}
 		line := mark + title
 		if badge := badgeOf(t); badge != "" {
-			line += " [" + badge + "]"
+			line += " " + badge // trailing plain word, as herdr renders status
 		}
 		lines = append(lines, line)
 	}

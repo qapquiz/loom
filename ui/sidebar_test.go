@@ -26,7 +26,7 @@ func TestSidebarShowsTitleAndStatus(t *testing.T) {
 	if !strings.Contains(lines[0], "vim") {
 		t.Fatalf("first line missing title: %q", lines[0])
 	}
-	if !strings.Contains(lines[0], "▸") {
+	if !strings.Contains(lines[0], "›") {
 		t.Fatalf("active terminal not marked: %q", lines[0])
 	}
 	if !strings.Contains(lines[1], "build") || !strings.Contains(lines[1], "working") {
@@ -41,8 +41,8 @@ func TestSidebarShowsTitleAndStatus(t *testing.T) {
 func TestSidebarShowsNameWhenTitleEmpty(t *testing.T) {
 	vim := hc.TerminalInfo{ID: "t44", Cols: 80, Rows: 24, Name: "loomvim"}
 	r := roomWith(vim)
-	if got := sidebar(r, "t44"); got != "▸ loomvim" {
-		t.Fatalf("sidebar = %q, want ▸ loomvim", got)
+	if got := sidebar(r, "t44"); got != "› loomvim" {
+		t.Fatalf("sidebar = %q, want › loomvim", got)
 	}
 }
 
@@ -53,7 +53,7 @@ func TestSidebarLifecycleBadge(t *testing.T) {
 	if !strings.Contains(s, "restarting") {
 		t.Fatalf("lost terminal not badged: %q", s)
 	}
-	if strings.Contains(s, "▸") {
+	if strings.Contains(s, "›") {
 		t.Fatalf("marked active with no pane: %q", s)
 	}
 }

@@ -321,3 +321,27 @@ func boolJSON(b bool) string {
 	}
 	return "false"
 }
+
+// ServeTB is Serve for benchmarks and other testing.TB users. Identical
+// behavior; c.t stays nil, so only happy-path cores should use it.
+func ServeTB(tb testing.TB) *Core {
+	tb.Helper()
+	dir := tb.TempDir()
+	path := filepath.Join(dir, "core.sock")
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		tb.Fatalf("listen: %v", err)
+	}
+	c := &Core{syncPath: path}
+	tb.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.serveConn(conn)
+		}
+	}()
+	return c
+}

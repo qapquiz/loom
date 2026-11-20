@@ -14,9 +14,9 @@ import (
 	"loom/pane"
 )
 
-func wirePane(t *testing.T) (*testcore.Core, *hc.Session, *pane.Pane) {
+func wirePane(t testing.TB) (*testcore.Core, *hc.Session, *pane.Pane) {
 	t.Helper()
-	core := testcore.Serve(t)
+	core := testcore.ServeTB(t)
 	sess, err := hc.Dial(core.SocketPath(), hc.Features{})
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
@@ -28,7 +28,7 @@ func wirePane(t *testing.T) (*testcore.Core, *hc.Session, *pane.Pane) {
 	return core, sess, p
 }
 
-func waitForPhase(t *testing.T, p *pane.Pane, d time.Duration, want pane.State) bool {
+func waitForPhase(t testing.TB, p *pane.Pane, d time.Duration, want pane.State) bool {
 	t.Helper()
 	deadline := time.Now().Add(d)
 	for time.Now().Before(deadline) {

@@ -13,7 +13,7 @@ Base: candidate C, per the cross-judge verdict and orchestrator agreement after 
 | verifiability | 1 | 1 | 2 |
 | usage honesty | 2 | 1 | 2 |
 
-Orchestrator divergence, resolved. Judge scored b usage=1 on a truncation artifact (b's opening scrolled past recovery and was re-emitted afterward). It scored a/b verifiability=1 for thin U6 paths. Both notes accepted. Base pick unchanged: C closes every loop, keeps emulator work off the tea goroutine (A's accepted mailbox-flood tradeoff disappears), and takes the grafts that fix its real gaps.
+Orchestrator divergence, resolved. Caveat on this table, recorded at run-end audit: the cross-judge scored candidate-a and candidate-b while they were still padded scrollback reconstructions missing their openings (two were 1113 lines of wrapped text). The base candidate C was complete, and the orchestrator re-read all three corrected candidates in full before accepting the verdict, so the base pick and the grafts rest on the corrected text. The per-criterion scores for a and b carry the reconstruction caveat; do not cite them without it.
 
 ## Module map (base C)
 
@@ -49,7 +49,8 @@ Wire types stay unexported inside hc. UI imports hc, never wire. Compiler-enforc
 - RenderState per-cell reads vs Formatter-only, RESOLVED by the wave 1 implementer against the bindings source: RenderStateRowIterator and RenderStateRowCells give real per-cell reads, valid until the next Update. The cheap Screen path stands.
 - Terminal resize API, RESOLVED: `Terminal.Resize(cols, rows uint16, cellWidthPx, cellHeightPx uint32)`, pixel args passable as 0 headless.
 - hc socket discovery, RESOLVED in wave 1: HC_SOCKET, HC_TERMINAL_SOCKET, HC_SESSION, then XDG paths.
-- OSC 7501 status vocabulary: still to confirm from hc schema during wave 2's U5 work.
+- OSC 7501 status vocabulary, RESOLVED live in wave 2: hc relays `idle`, `working`, `done`, `blocked`, `error`, stored as reported, never inferred (schema README). Sidebar badges rendered [working] and [done] from live events.
+- Mouse geometry, RESOLVED with a recorded compromise: MouseEncoder gets a synthetic 1x1 px cell size so cell-coordinate SGR sequences emit. Cell protocols are unaffected; pixel-geometry queries (CSI 14t/16t) misreport until M2 sends FACTS with real cell pixels. Wave 1 commit 0f0c07d carries the code comment.
 
 ## Wave plan
 

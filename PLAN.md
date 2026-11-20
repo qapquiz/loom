@@ -33,3 +33,11 @@ Each unit ends in a check before the next starts.
 - U4 input. Keys as DATA drive a child shell; WRITE_PTY effect bytes route to hc AUTOMATIC_INPUT. Check: screen shows the echo output of a programmatically typed command.
 - U5 bloom frame. One pane node in a bubbletea program, RESIZE sent on resize, detach and reattach keeps the screen. Check: real-surface capture of vim.
 - U6 numbers. Run the bindings' own benchmarks first. Apply the benchmark-checklist skill before reporting any number.
+
+## M2 queue, ordered by run-end evidence
+
+1. SGR assembly hillclimb. 2.54 ms is 78% of the per-changed-frame cost and allocation-bound (92k allocs at 200x60); two busy panes exceed the 120 fps budget. Cache SGR per style, append bytes directly, emit fewer resets. Benchmarks already committed.
+2. Live-gated integration tests. Grow LOOM_TEST_HC=1 tests from cmd/loomprobe (dial, snapshot, attach, first paint, resize). Live behavior currently rests on manual captures, which do not rerun.
+3. FACTS with real cell pixels. The synthetic 1x1 MouseEncoder size makes pixel-geometry queries (CSI 14t/16t) misreport. Send display facts per hc's FACTS frame.
+4. Build story. The lib depends on a sibling repo's untracked build dir via PKG_CONFIG_PATH. Vendor the built lib or add a Makefile target that builds it pinned.
+5. Multi-pane perf re-check after item 1, splits and tabs, scrollback viewing.

@@ -22,7 +22,11 @@ func sidebar(r *room.Room, active hc.TerminalID) string {
 		if t.ID == active {
 			mark = "▸ "
 		}
-		line := mark + t.Info.Title
+		title := t.Info.Title
+		if title == "" {
+			title = t.Info.Name
+		}
+		line := mark + title
 		if badge := badgeOf(t); badge != "" {
 			line += " [" + badge + "]"
 		}

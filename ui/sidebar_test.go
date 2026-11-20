@@ -37,6 +37,15 @@ func TestSidebarShowsTitleAndStatus(t *testing.T) {
 	}
 }
 
+// hc programs often set no title; the record name carries the identity then.
+func TestSidebarShowsNameWhenTitleEmpty(t *testing.T) {
+	vim := hc.TerminalInfo{ID: "t44", Cols: 80, Rows: 24, Name: "loomvim"}
+	r := roomWith(vim)
+	if got := sidebar(r, "t44"); got != "▸ loomvim" {
+		t.Fatalf("sidebar = %q, want ▸ loomvim", got)
+	}
+}
+
 func TestSidebarLifecycleBadge(t *testing.T) {
 	r := roomFixture()
 	r.Apply(hc.Event{Kind: hc.EventLost, ID: "t9"})

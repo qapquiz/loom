@@ -175,7 +175,7 @@ func pickAttach(r *room.Room, want string) hc.TerminalID {
 	ts := r.Terminals()
 	if want != "" {
 		for _, t := range ts {
-			if t.State == room.Listed && (string(t.ID) == want || t.Info.Title == want) {
+			if t.State == room.Listed && (string(t.ID) == want || t.Info.Title == want || t.Info.Name == want) {
 				return t.ID
 			}
 		}

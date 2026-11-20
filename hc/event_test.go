@@ -31,8 +31,8 @@ func TestEventFeedSeqAndMissed(t *testing.T) {
 		want []Event
 	}{
 		// seq above baseline: pass, advance.
-		{`{"method":"event","params":{"seq":6,"type":"created","terminal":"t7","data":{"address":"t7","title":"bash","cols":80,"rows":24,"labels":{},"state":"live","status":{"state":"idle"}}}}`,
-			[]Event{{Kind: EventCreated, Seq: 6, ID: "t7", Info: TerminalInfo{ID: "t7", Title: "bash", Cols: 80, Rows: 24, Status: "idle", Labels: map[string]string{}}}}},
+		{`{"method":"event","params":{"seq":6,"type":"created","terminal":"t7","data":{"address":"t7","title":"bash","name":"build","cols":80,"rows":24,"labels":{},"state":"live","status":{"state":"idle"}}}}`,
+			[]Event{{Kind: EventCreated, Seq: 6, ID: "t7", Info: TerminalInfo{ID: "t7", Title: "bash", Name: "build", Cols: 80, Rows: 24, Status: "idle", Labels: map[string]string{}}}}},
 		// heartbeat at current seq: stale, dropped.
 		{`{"method":"heartbeat","params":{"seq":6}}`, nil},
 		{`{"method":"event","params":{"seq":7,"type":"size","terminal":"t7","data":{"cols":100,"rows":30}}}`,

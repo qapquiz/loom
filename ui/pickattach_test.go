@@ -18,7 +18,9 @@ func roomWith(infos ...hc.TerminalInfo) *room.Room {
 }
 
 func TestPickAttach(t *testing.T) {
-	r := roomWith(listed("t7", "bash"), listed("t9", "vim"))
+	vim := listed("t44", "")
+	vim.Name = "loomvim"
+	r := roomWith(listed("t7", "bash"), vim)
 
 	cases := []struct {
 		name string
@@ -26,9 +28,9 @@ func TestPickAttach(t *testing.T) {
 		exp  hc.TerminalID
 	}{
 		{"unset falls back to first listed", "", "t7"},
-		{"by id", "t9", "t9"},
-		{"by title", "vim", "t9"},
-		{"title wins first match", "bash", "t7"},
+		{"by id", "t44", "t44"},
+		{"by title", "bash", "t7"},
+		{"by name", "loomvim", "t44"},
 		{"unknown name waits", "emacs", ""},
 		{"id matches despite title", "t7", "t7"},
 	}
@@ -42,8 +44,8 @@ func TestPickAttach(t *testing.T) {
 	}
 
 	// A target that exists but is not attachable is not a match.
-	r.Apply(hc.Event{Kind: hc.EventLost, ID: "t9"})
-	if got := pickAttach(r, "vim"); got != "" {
+	r.Apply(hc.Event{Kind: hc.EventLost, ID: "t44"})
+	if got := pickAttach(r, "loomvim"); got != "" {
 		t.Fatalf("picked restarting terminal %q", got)
 	}
 	// Unset still finds the remaining Listed terminal.

@@ -12,6 +12,7 @@ type TerminalID string
 type TerminalInfo struct {
 	ID     TerminalID
 	Title  string
+	Name   string // hc record name ("loomvim"), set independently of the program title
 	Status string // OSC 7501 root status word (state) relayed by hc; never scraped
 	Cols   uint16
 	Rows   uint16
@@ -200,6 +201,7 @@ func mapEvent(p eventNoteParams) []Event {
 type terminalRecord struct {
 	Address  string            `json:"address"`
 	Title    string            `json:"title"`
+	Name     string            `json:"name"`
 	Cols     uint16            `json:"cols"`
 	Rows     uint16            `json:"rows"`
 	Labels   map[string]string `json:"labels"`
@@ -226,6 +228,7 @@ func (r terminalRecord) info() TerminalInfo {
 	info := TerminalInfo{
 		ID:     TerminalID(r.Address),
 		Title:  r.Title,
+		Name:   r.Name,
 		Cols:   r.Cols,
 		Rows:   r.Rows,
 		Labels: r.Labels,

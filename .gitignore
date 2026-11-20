@@ -1,4 +1,4 @@
 decisions.tsv
 build/
-loom
+/loom
 *.test

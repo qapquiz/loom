@@ -1,6 +1,17 @@
 // Package pane owns the emulator side of one attached terminal: the stream
 // lifecycle machine, the libghostty handles, and the Screen — the ONE type
 // that crosses from emulator state to the UI.
+//
+// Binding assumptions verified against the pinned bindings source
+// (~/Projects/go-libghostty, commit b13f277ddcb2):
+//
+//   - RenderState has real per-cell reads: RenderStateRowIterator →
+//     RenderStateRowCells with Raw/Codepoint/Wide/StyleInto, valid until the
+//     next Update; copied values may be retained. The cheap Screen path stands.
+//   - Terminal resize is Terminal.Resize(cols, rows uint16, cellWidthPx,
+//     cellHeightPx uint32) — four args, cell px passable as 0 headless.
+//   - Dirty-skip rides RenderStateDirtyFalse, which only reports after a
+//     publish calls Clean (see emulator.go publish).
 package pane
 
 // The pane stream machine (graft 1): a total advance(state, change) function

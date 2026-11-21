@@ -74,6 +74,11 @@ func (p *Pane) apply(op Op) {
 		} else {
 			p.out.Focus(false)
 		}
+	case OpFacts:
+		if !p.live() {
+			return
+		}
+		p.out.Facts([]byte(op.Facts))
 	}
 }
 

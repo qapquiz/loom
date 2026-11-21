@@ -91,6 +91,25 @@ func newEmulator(p *Pane) *emulator {
 	term.SetEffectProgramStatus(func(_ *libghostty.Terminal, status libghostty.ProgramStatus) {
 		e.status = statusWord(status.State)
 	})
+	// Size-report truth: rows/cols from the emulator itself, cell px from the
+	// stored terminal geometry. One handler derives every report style
+	// (CSI 14/16/18/19 t, mode 2048) from the single SizeReportSize.
+	term.SetEffectSize(func(t *libghostty.Terminal) (libghostty.SizeReportSize, bool) {
+		cols, err := t.Cols()
+		if err != nil {
+			return libghostty.SizeReportSize{}, false
+		}
+		rows, err := t.Rows()
+		if err != nil {
+			return libghostty.SizeReportSize{}, false
+		}
+		return libghostty.SizeReportSize{
+			Rows:       rows,
+			Columns:    cols,
+			CellWidth:  p.cellW,
+			CellHeight: p.cellH,
+		}, true
+	})
 
 	e.term = term
 	e.rs = rs
@@ -174,23 +193,7 @@ func (p *Pane) publish() {
 	if err != nil {
 		return
 	}
-	// Synthetic 1x1 px cells: the M2 pixel hunt found no honest source.
-	// bubbletea v2.1.2's WindowSizeMsg is cells-only (x/term's GetSize drops
-	// TIOCGWINSZ xpixel/ypixel) and tea.Mouse is cell coordinates, while the
-	// emulator's px reads (WidthPx/HeightPx) are arithmetic on the cell px
-	// Resize was given, 0 headless; with no size-report effect registered it
-	// answers CSI 14t/16t with silence, not a lie. The encoder refuses to
-	// emit anything without a non-zero cell size, so 1x1 stays. At 1x1 the
-	// pane's cell-coord positions divide out to themselves, so cell-based
-	// protocols (X10, SGR, URxvt) encode correctly; only SGR-pixels stays
-	// approximate until loom reads pixel geometry itself (its own
-	// TIOCGWINSZ) or bubbletea exposes one.
-	e.mouseEnc.SetSize(libghostty.MouseEncoderSize{
-		ScreenWidth:  uint32(cols),
-		ScreenHeight: uint32(rows),
-		CellWidth:    1,
-		CellHeight:   1,
-	})
+	p.syncMouseSize(uint16(cols), uint16(rows))
 	screen := &Screen{
 		Cols:   int(cols),
 		Rows:   int(rows),
@@ -298,4 +301,23 @@ func readCell(rc *libghostty.RenderStateRowCells) Cell {
 
 func packRGB(c libghostty.ColorRGB) uint32 {
 	return uint32(c.R)<<16 | uint32(c.G)<<8 | uint32(c.B)
+}
+
+// syncMouseSize feeds the encoder the current geometry: screen px are
+// cols×cellW and rows×cellH. The compromise is conditional — real cell px
+// when loom's own TIOCGWINSZ reported it, the 1x1 synthetic cell headless,
+// where cells and pixels coincide so cell-coordinate protocols (X10, SGR,
+// URxvt) still encode correctly and only pixel SGR stays approximate. The
+// encoder refuses to emit without a non-zero cell size; cellW/cellH are
+// guarded to ≥1 at the store (SetCellPx), never 0 here.
+func (p *Pane) syncMouseSize(cols, rows uint16) {
+	if p.emu == nil || p.emu.mouseEnc == nil {
+		return
+	}
+	p.emu.mouseEnc.SetSize(libghostty.MouseEncoderSize{
+		ScreenWidth:  uint32(cols) * p.cellW,
+		ScreenHeight: uint32(rows) * p.cellH,
+		CellWidth:    p.cellW,
+		CellHeight:   p.cellH,
+	})
 }

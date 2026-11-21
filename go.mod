@@ -7,6 +7,7 @@ require (
 	charm.land/bubbletea/v2 v2.1.2
 	github.com/charmbracelet/x/ansi v0.11.10
 	go.mitchellh.com/libghostty v0.0.0-20261107144202-b13f277ddcb2
+	golang.org/x/sys v0.50.0
 )
 
 require (
@@ -24,5 +25,4 @@ require (
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/xo/terminfo v1.3.1 // indirect
 	golang.org/x/sync v0.25.0 // indirect
-	golang.org/x/sys v0.50.0 // indirect
 )

@@ -247,3 +247,76 @@ func TestAppResizeWhenWindowSizePrecedesAttach(t *testing.T) {
 			f.Payload[0] == 80 && f.Payload[2] == 30
 	})
 }
+
+// Display facts flow once the attach confirms — the app's confirmation signal
+// is the first live wake (the same seam that pays the FOCUS debt). The payload
+// carries the schema's field names: cell as [width,height]; without a
+// WindowSizeMsg the cell stays the 1x1 synthetic one (headless truth).
+func TestAppSendsDisplayFactsAfterAttachConfirmation(t *testing.T) {
+	c, a := newApp(t, `[{"address":"t7","title":"vim","cols":80,"rows":24}]`)
+	if !waitForPhase(t, a.pane, 2*time.Second, pane.StateAttached) {
+		t.Fatal("no attach")
+	}
+	a.Update(wakeMsg{}) // first live wake: attach confirmation
+	var payload []byte
+	waitForFrame(t, c, 2*time.Second, func(f testcore.Frame) bool {
+		if f.Kind == 5 && f.Ch == 7 {
+			payload = f.Payload
+			return true
+		}
+		return false
+	})
+	var got struct {
+		Cell []uint32 `json:"cell"`
+	}
+	if err := json.Unmarshal(payload, &got); err != nil {
+		t.Fatalf("FACTS payload %q: %v", payload, err)
+	}
+	if len(got.Cell) != 2 || got.Cell[0] != 1 || got.Cell[1] != 1 {
+		t.Fatalf("cell = %v, want the 1x1 headless cell [1 1]", got.Cell)
+	}
+}
+
+// A cell-px change while live reports immediately: the WindowSizeMsg path
+// stores the new truth and queues the Display report in one motion.
+func TestAppSendsFactsWhenCellPxChanges(t *testing.T) {
+	c, a := newApp(t, `[{"address":"t7","title":"vim","cols":80,"rows":24}]`)
+	if !waitForPhase(t, a.pane, 2*time.Second, pane.StateAttached) {
+		t.Fatal("no attach")
+	}
+	a.setCellPx(9, 18) // what measureCellPx hands over on a real terminal
+	var payload []byte
+	waitForFrame(t, c, 2*time.Second, func(f testcore.Frame) bool {
+		if f.Kind == 5 && f.Ch == 7 {
+			payload = f.Payload
+			return true
+		}
+		return false
+	})
+	var got struct {
+		Cell []uint32 `json:"cell"`
+	}
+	if err := json.Unmarshal(payload, &got); err != nil {
+		t.Fatalf("FACTS payload %q: %v", payload, err)
+	}
+	if len(got.Cell) != 2 || got.Cell[0] != 9 || got.Cell[1] != 18 {
+		t.Fatalf("cell = %v, want [9 18]", got.Cell)
+	}
+}
+
+// measureCellPx guards its edges: zero dimensions divide nothing, and a
+// headless stdin (no tty behind the ioctl) falls back to the 1x1 cell.
+func TestMeasureCellPxGuardsZeroAndHeadless(t *testing.T) {
+	if w, h := measureCellPx(0, 24); w != 1 || h != 1 {
+		t.Fatalf("zero cols = %dx%d, want 1x1", w, h)
+	}
+	if w, h := measureCellPx(80, 0); w != 1 || h != 1 {
+		t.Fatalf("zero rows = %dx%d, want 1x1", w, h)
+	}
+	// Under go test stdin is not a tty (or a tty reporting no px): either
+	// way the result must be usable, never a divide-by-zero or a zero cell.
+	w, h := measureCellPx(80, 24)
+	if w == 0 || h == 0 {
+		t.Fatalf("headless cell = %dx%d, want non-zero", w, h)
+	}
+}

@@ -8,6 +8,7 @@ package pane
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -277,5 +278,52 @@ func TestClosedExitAndLossKeepWant(t *testing.T) {
 	p.Change(ChangeRestarted)
 	if !waitFor(2*time.Second, func() bool { return p.Phase() == StateAttached }) {
 		t.Fatalf("phase after restarted = %v, want attached", p.Phase())
+	}
+}
+
+// The FACTS frame (kind 5): Display facts hit the wire on the stream channel
+// with the schema's exact field names — cell as [width,height] px; the color
+// fields stay null (omitted) until loom has a source for them. The pane
+// transports the app-built payload; SetCellPx stores the px it describes.
+func TestFactsFrameHitsWireWithSchemaFieldNames(t *testing.T) {
+	core := testcore.Serve(t)
+	_, p := wirePane(t, core, false)
+	p.SetCellPx(9, 18) // before attach: the store rides the pump queue
+	attach(t, p)
+	p.Enqueue(Op{Kind: OpFacts, Facts: `{"cell":[9,18]}`}) // the app-shaped send
+
+	var payload []byte
+	if !waitFor(2*time.Second, func() bool {
+		for _, f := range core.Frames() {
+			if f.Kind == 5 && f.Ch == 7 {
+				payload = f.Payload
+				return true
+			}
+		}
+		return false
+	}) {
+		t.Fatal("no FACTS frame on the stream channel")
+	}
+	var got struct {
+		Cell []uint32 `json:"cell"`
+	}
+	if err := json.Unmarshal(payload, &got); err != nil {
+		t.Fatalf("FACTS payload %q: %v", payload, err)
+	}
+	if len(got.Cell) != 2 || got.Cell[0] != 9 || got.Cell[1] != 18 {
+		t.Fatalf("cell = %v, want [9 18]", got.Cell)
+	}
+	// While not live the report is dropped by the phase gate, not queued.
+	core.CloseStream(`{"reason":"exited","exit_code":0}`)
+	if !waitFor(2*time.Second, func() bool { return p.Phase() == StateExited }) {
+		t.Fatalf("phase after exited CLOSE = %v", p.Phase())
+	}
+	n := len(core.Frames())
+	p.Enqueue(Op{Kind: OpFacts, Facts: `{"cell":[7,7]}`})
+	time.Sleep(100 * time.Millisecond)
+	for _, f := range core.Frames()[n:] {
+		if f.Kind == 5 {
+			t.Fatal("FACTS posted without a live stream")
+		}
 	}
 }

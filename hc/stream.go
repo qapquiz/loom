@@ -30,6 +30,10 @@ type StreamOut interface {
 	AutoReply(p []byte)
 	// Resize sends a RESIZE frame (u16 LE cols, u16 LE rows).
 	Resize(cols, rows uint16)
+	// Facts sends a FACTS frame (kind 5): viewer-reported Display facts as
+	// raw JSON on the stream channel (the schema's Display type; the caller
+	// owns the payload, hc only transports it).
+	Facts(raw json.RawMessage)
 	// Focus sends a FOCUS frame: 1 gained, 0 lost.
 	Focus(gained bool)
 	// Close sends CLOSE: the viewer detaches; the core answers with an empty
@@ -71,6 +75,10 @@ func (o streamOut) Focus(gained bool) {
 		b = 1
 	}
 	o.s.writeFrame(frame{ch: o.ch, kind: frameFocus, payload: []byte{b}})
+}
+
+func (o streamOut) Facts(raw json.RawMessage) {
+	o.s.writeFrame(frame{ch: o.ch, kind: frameFacts, payload: raw})
 }
 
 func (o streamOut) Close() {

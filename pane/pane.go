@@ -57,6 +57,7 @@ const (
 	OpMouse
 	OpResize
 	OpActive
+	OpFacts
 )
 
 // Key and Mouse are plain data on purpose: libghostty's KeyEvent/MouseEvent
@@ -82,7 +83,8 @@ type Op struct {
 	Mouse  Mouse
 	Cols   uint16
 	Rows   uint16
-	Active bool // OpActive: loom became (or stopped being) the active viewer
+	Active bool   // OpActive: loom became (or stopped being) the active viewer
+	Facts  string // OpFacts: raw Display JSON; the app owns the payload, the pane transports it (string keeps Op comparable, like Key.Text)
 }
 
 // Pane implements hc.Stream. All emulator mutation happens on hc's read-loop
@@ -102,6 +104,8 @@ type Pane struct {
 	wantRow uint16
 	sentCol uint16
 	sentRow uint16
+	cellW   uint32 // cell px; 1x1 until the kernel reports real geometry. Session-goroutine only
+	cellH   uint32
 
 	emu      *emulator
 	attachFn func() // wave-2 seam: the app sets sess.Attach(id, p)
@@ -115,6 +119,8 @@ func New(id hc.TerminalID, wake func()) *Pane {
 		wantRow: 24,
 		sentCol: 80,
 		sentRow: 24,
+		cellW:   1,
+		cellH:   1,
 	}
 	p.state.Store(uint32(StateIdle))
 	p.resetEmulator()
@@ -141,6 +147,22 @@ func (p *Pane) Change(ch Change) { p.enqueue(ch) }
 // before the first Enqueue/Change; before that they are dropped.
 func (p *Pane) SetPump(fn func(func())) { p.pump = fn }
 
+// SetCellPx records the terminal's real cell size in pixels (loom's own
+// TIOCGWINSZ; the pane keeps the 1x1 synthetic cell when there is none).
+// Stored on the session goroutine — publish, Resize and the size-report
+// effect read it there, honoring the bindings' single-goroutine contract.
+// Dropped before SetPump; callers re-post (the app pushes its stored value
+// at attach time, mirroring postSize).
+func (p *Pane) SetCellPx(w, h uint32) {
+	if w == 0 || h == 0 {
+		w, h = 1, 1
+	}
+	p.enqueue(cellSize{w, h})
+}
+
+// cellSize is the pump-side store request for SetCellPx.
+type cellSize struct{ w, h uint32 }
+
 func (p *Pane) enqueue(v any) {
 	if p.pump == nil {
 		return
@@ -151,6 +173,9 @@ func (p *Pane) enqueue(v any) {
 			p.apply(v)
 		case Change:
 			p.applyChange(v)
+		case cellSize:
+			p.cellW, p.cellH = v.w, v.h
+			p.syncMouseSize(p.wantCol, p.wantRow) // the encoder's px context must not wait for the next dirty publish
 		}
 	})
 }

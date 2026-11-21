@@ -23,6 +23,7 @@ const (
 	kindClose     = 2
 	kindResize    = 3
 	kindFocus     = 4
+	kindFacts     = 5
 	kindAutoInput = 6
 	eventsChannel = 2
 	streamChannel = 7
@@ -119,6 +120,9 @@ func (c *Core) run(conn net.Conn) {
 			case f.kind == kindClose:
 				// Viewer detaches; ack with an empty CLOSE.
 				c.write(conn, frame{ch: f.ch, kind: kindClose})
+				continue
+			case f.kind == kindFacts:
+				// Viewer Display report; recorded only.
 				continue
 			default:
 				continue

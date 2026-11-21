@@ -1,11 +1,13 @@
 package ui
 
 import (
+	"encoding/json"
 	"os"
 
 	tea "charm.land/bubbletea/v2"
 
 	"bloomfx.dev/bloom"
+	"golang.org/x/sys/unix"
 
 	"loom/hc"
 	"loom/pane"
@@ -28,8 +30,9 @@ type App struct {
 	width  int
 	height int
 
-	sentW, sentH int  // last pane size posted from frame geometry
-	focused      bool // terminal focus; gates the passive size-follow rule
+	cellW, cellH uint32 // terminal cell px; 1x1 until the kernel reports real geometry
+	sentW, sentH int    // last pane size posted from frame geometry
+	focused      bool   // terminal focus; gates the passive size-follow rule
 	paneLiveSeen bool
 }
 
@@ -45,6 +48,8 @@ func New(sess *hc.Session) *App {
 		ui:      bloom.New(),
 		wake:    make(chan struct{}, 1),
 		focused: true,
+		cellW:   1,
+		cellH:   1,
 	}
 }
 
@@ -91,6 +96,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, tea.Quit
 	case tea.WindowSizeMsg:
 		a.width, a.height = msg.Width, msg.Height
+		a.setCellPx(measureCellPx(msg.Width, msg.Height))
 		a.postSize(msg.Width, msg.Height)
 	case tea.KeyPressMsg:
 		if msg.Code == 'q' && msg.Mod&tea.ModCtrl != 0 {
@@ -163,7 +169,9 @@ func (a *App) attachFirst() {
 	// The initial WindowSizeMsg usually predates the snapshot, so re-post
 	// the stored size here: OpResize records want while not live, and
 	// Connected's reconcile imposes it (the pane's own idempotence keeps
-	// this an echo, not a fight).
+	// this an echo, not a fight). Cell px rides the same re-post: the store
+	// was dropped before SetPump existed.
+	a.pushCellPx()
 	a.postSize(a.width, a.height)
 }
 
@@ -202,7 +210,74 @@ func (a *App) onWake() {
 	if a.pane != nil && !a.paneLiveSeen && a.pane.Phase() == pane.StateAttached {
 		a.paneLiveSeen = true
 		a.pane.Enqueue(pane.Op{Kind: pane.OpActive, Active: true})
+		// Attach confirmed: the Display facts queued while not live were
+		// dropped by the pane's phase gate, so the report is owed now — the
+		// same debt FOCUS pays on this first live wake.
+		a.sendFacts()
 	}
+}
+
+// measureCellPx reads the terminal's pixel geometry straight from the
+// kernel: bubbletea v2.1.2's WindowSizeMsg is cells-only (x/term's GetSize
+// drops TIOCGWINSZ xpixel/ypixel), so loom does its own ioctl beside it.
+// Zero pixels, a failed ioctl or a sub-cell quotient (rounded to 0) leave
+// the 1x1 synthetic cell — the headless compromise.
+func measureCellPx(cols, rows int) (uint32, uint32) {
+	if cols <= 0 || rows <= 0 {
+		return 1, 1
+	}
+	ws, err := unix.IoctlGetWinsize(int(os.Stdin.Fd()), unix.TIOCGWINSZ)
+	if err != nil || ws.Xpixel == 0 || ws.Ypixel == 0 {
+		return 1, 1
+	}
+	w := uint32(ws.Xpixel) / uint32(cols)
+	h := uint32(ws.Ypixel) / uint32(rows)
+	if w == 0 || h == 0 {
+		return 1, 1
+	}
+	return w, h
+}
+
+// setCellPx threads pixel truth into the pane and reports it as Display
+// facts whenever it changed; the stored value survives pane swaps (it is
+// the terminal's truth, not the pane's).
+func (a *App) setCellPx(w, h uint32) {
+	if w == 0 || h == 0 {
+		w, h = 1, 1
+	}
+	if w == a.cellW && h == a.cellH {
+		return
+	}
+	a.cellW, a.cellH = w, h
+	a.pushCellPx()
+	a.sendFacts()
+}
+
+func (a *App) pushCellPx() {
+	if a.pane != nil {
+		a.pane.SetCellPx(a.cellW, a.cellH)
+	}
+}
+
+// displayFacts is the schema's Display type, reported by the client: only
+// the fields loom holds truth for are set (cell px); bg/fg/cursor stay
+// null until a color source exists.
+type displayFacts struct {
+	Cell []uint32 `json:"cell"`
+}
+
+// sendFacts queues the Display report for the wire. The pane is the
+// phase-gated writer: while not live the op is dropped, and the pending
+// truth rides the attach-confirmation send instead (onWake).
+func (a *App) sendFacts() {
+	if a.pane == nil {
+		return
+	}
+	raw, err := json.Marshal(displayFacts{Cell: []uint32{a.cellW, a.cellH}})
+	if err != nil {
+		return
+	}
+	a.pane.Enqueue(pane.Op{Kind: pane.OpFacts, Facts: string(raw)})
 }
 
 // postSize solves the tree at w×h and posts a RESIZE when the pane rect

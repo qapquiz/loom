@@ -14,8 +14,9 @@ func (p *Pane) reconcile(force bool) {
 		return
 	}
 	if p.emu != nil && p.emu.term != nil {
-		// Cell px unknown headless; size-report replies are out of spike scope.
-		if err := p.emu.term.Resize(p.wantCol, p.wantRow, 0, 0); err != nil {
+		// Cell px: the terminal's real geometry when the kernel reported it,
+		// 1x1 headless — never 0, so emulator px reads stay derivable.
+		if err := p.emu.term.Resize(p.wantCol, p.wantRow, p.cellW, p.cellH); err != nil {
 			return
 		}
 	}

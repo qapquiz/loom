@@ -3,8 +3,8 @@ package ui
 // PaneNode is the bloom leaf for one terminal. bloom's node contract is
 // View() string (nodes have no per-cell draw API; canvas.Surface is for
 // effects and would break the unchanged-frame skip), so the pane's Screen is
-// assembled into a styled string by direct SGR emission from Cells, one
-// pass, no lipgloss.
+// assembled into a styled string by direct SGR emission from Cells, no
+// lipgloss.
 //
 // The string is cached by Screen pointer identity. The pane publishes a
 // fresh immutable Screen only when the frame actually changed, so pointer
@@ -43,9 +43,10 @@ func renderScreen(s *pane.Screen) string {
 	if s == nil || s.Cols <= 0 || s.Rows <= 0 {
 		return ""
 	}
-	// One preallocated buffer for the whole view. 8 bytes per cell covers
-	// text plus a typical SGR budget; a transition-dense frame just grows it.
-	b := make([]byte, 0, s.Rows*s.Cols*8)
+	// Exact capacity from a counting pass: a transition-dense frame spends
+	// ~25-30 SGR bytes per cell, far past any per-cell guess, and growth
+	// reallocation is memcpy the emit pass would otherwise pay repeatedly.
+	b := make([]byte, 0, sizeScreen(s))
 	cur := styleState{}
 	for row := 0; row < s.Rows; row++ {
 		skip := false
@@ -81,6 +82,48 @@ func renderScreen(s *pane.Screen) string {
 		}
 	}
 	return string(b)
+}
+
+// sizeScreen counts the exact byte length renderScreen will emit for s,
+// walking it with identical transition and wide-tail logic. If the two ever
+// drift, only the capacity is wrong (one append growth); the output bytes
+// come solely from the emit pass.
+func sizeScreen(s *pane.Screen) int {
+	n := 0
+	cur := styleState{}
+	for row := 0; row < s.Rows; row++ {
+		skip := false
+		base := row * s.Cols
+		for col := 0; col < s.Cols; col++ {
+			c := s.Cells[base+col]
+			if skip {
+				skip = false
+				continue
+			}
+			skip = c.Wide
+			want := styleState{fg: c.S.FG, bg: c.S.BG, attr: c.S.Attr}
+			if s.Cursor.Visible && row == s.Cursor.Row && col == s.Cursor.Col {
+				want.attr |= pane.AttrInverse
+			}
+			if want != cur {
+				n += sgrSize(want)
+				cur = want
+			}
+			if c.Text == "" {
+				n++
+			} else {
+				n += len(c.Text)
+			}
+		}
+		if cur != (styleState{}) {
+			n += len("\x1b[0m")
+			cur = styleState{}
+		}
+		if row < s.Rows-1 {
+			n++
+		}
+	}
+	return n
 }
 
 // styleState mirrors the SGR state a cell parser holds. Zero value is the
@@ -125,6 +168,42 @@ func appendSGR(b []byte, s styleState) []byte {
 	}
 	b[len(b)-1] = 'm' // the trailing ';' becomes the terminator
 	return b
+}
+
+// sgrSize is appendSGR's byte count for s. The two must stay in lockstep,
+// but a mismatch only mis-sizes the buffer, never the emitted bytes.
+func sgrSize(s styleState) int {
+	if s == (styleState{}) {
+		return 4 // appendSGR truncates to the reset alone
+	}
+	n := 6 // "\x1b[0m" plus "\x1b["
+	for _, a := range attrSGR {
+		if s.attr&a.bit != 0 {
+			n += 2
+		}
+	}
+	if s.fg != 0 {
+		n += rgbSize(s.fg)
+	}
+	if s.bg != 0 {
+		n += rgbSize(s.bg)
+	}
+	return n
+}
+
+// rgbSize matches appendRGB: prefix, three 1-3 digit components, separators.
+func rgbSize(c uint32) int {
+	return 8 + digitCount(c>>16&0xff) + digitCount(c>>8&0xff) + digitCount(c&0xff)
+}
+
+func digitCount(v uint32) int {
+	if v >= 100 {
+		return 3
+	}
+	if v >= 10 {
+		return 2
+	}
+	return 1
 }
 
 func appendRGB(b []byte, pfx string, c uint32) []byte {

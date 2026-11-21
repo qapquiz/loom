@@ -4,7 +4,7 @@ Go bindings for libghostty-vt, maintained by the Ghostty author. Pinned at pseud
 
 ## Build on this machine
 
-Binding source: ~/Projects/go-libghostty (cloned). Its Makefile builds libghostty-vt via CMake FetchContent at pinned ghostty commit 5813c9461d5af78b6307a1254d00b1bc190eaccd. Outputs land in build/_deps/ghostty-src/zig-out, with pkg-config under lib/pkgconfig. The build runs in hc terminal `libbuild`. Client builds set `PKG_CONFIG_PATH=$HOME/Projects/go-libghostty/build/_deps/ghostty-src/zig-out/lib/pkgconfig`. Static linking by default; zig 0.17.1 is the compiler for the C build.
+libghostty-vt builds in-repo: `make deps` shallow-clones ghostty at pinned commit 5813c9461d5af78b6307a1254d00b1bc190eaccd and runs `zig build -Demit-lib-vt -Demit-xcframework=false -Doptimize=ReleaseFast --prefix build/libghostty`. The flags mirror ghostty's own CMakeLists.txt for a release build (CMake RELEASE maps to ReleaseFast); zig 0.17.1 is the compiler. pkg-config files land in build/libghostty/lib/pkgconfig, and the Makefile's build/test/run targets export that PKG_CONFIG_PATH (plus LD_LIBRARY_PATH for the shared lib) so no sibling checkout is consulted. The stamp build/.deps-<sha> makes deps idempotent and rebuilds on pin change. The ~/Projects/go-libghostty checkout remains the reference for the pinned build the Makefile reproduces.
 
 ## API inventory (from the repo sources, read this session)
 

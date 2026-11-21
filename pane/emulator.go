@@ -174,12 +174,17 @@ func (p *Pane) publish() {
 	if err != nil {
 		return
 	}
-	// Synthetic 1x1 px cells: headless loom has no pixel geometry and M1
-	// negotiates no FACTS, but the encoder refuses to emit anything without
-	// a non-zero cell size. At 1x1 the pane's cell-coord positions divide
-	// out to themselves, so cell-based protocols (X10, SGR, URxvt) encode
-	// correctly; only SGR-pixels stays approximate, which is the M1
-	// posture for anything pixel-denominated.
+	// Synthetic 1x1 px cells: the M2 pixel hunt found no honest source.
+	// bubbletea v2.1.2's WindowSizeMsg is cells-only (x/term's GetSize drops
+	// TIOCGWINSZ xpixel/ypixel) and tea.Mouse is cell coordinates, while the
+	// emulator's px reads (WidthPx/HeightPx) are arithmetic on the cell px
+	// Resize was given, 0 headless; with no size-report effect registered it
+	// answers CSI 14t/16t with silence, not a lie. The encoder refuses to
+	// emit anything without a non-zero cell size, so 1x1 stays. At 1x1 the
+	// pane's cell-coord positions divide out to themselves, so cell-based
+	// protocols (X10, SGR, URxvt) encode correctly; only SGR-pixels stays
+	// approximate until loom reads pixel geometry itself (its own
+	// TIOCGWINSZ) or bubbletea exposes one.
 	e.mouseEnc.SetSize(libghostty.MouseEncoderSize{
 		ScreenWidth:  uint32(cols),
 		ScreenHeight: uint32(rows),

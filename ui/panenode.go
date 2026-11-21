@@ -12,9 +12,6 @@ package ui
 // and costs bloom one unchanged-frame comparison.
 
 import (
-	"strconv"
-	"strings"
-
 	"loom/pane"
 )
 
@@ -46,7 +43,9 @@ func renderScreen(s *pane.Screen) string {
 	if s == nil || s.Cols <= 0 || s.Rows <= 0 {
 		return ""
 	}
-	var b strings.Builder
+	// One preallocated buffer for the whole view. 8 bytes per cell covers
+	// text plus a typical SGR budget; a transition-dense frame just grows it.
+	b := make([]byte, 0, s.Rows*s.Cols*8)
 	cur := styleState{}
 	for row := 0; row < s.Rows; row++ {
 		skip := false
@@ -63,30 +62,25 @@ func renderScreen(s *pane.Screen) string {
 				want.attr |= pane.AttrInverse
 			}
 			if want != cur {
-				b.WriteString("\x1b[0m")
-				if p := want.sgrParams(); p != "" {
-					b.WriteString("\x1b[")
-					b.WriteString(p)
-					b.WriteString("m")
-				}
+				b = appendSGR(b, want)
 				cur = want
 			}
 			if c.Text == "" {
-				b.WriteByte(' ')
+				b = append(b, ' ')
 			} else {
-				b.WriteString(c.Text)
+				b = append(b, c.Text...)
 			}
 		}
 		// End every styled run at the row edge so lines stay independent.
 		if cur != (styleState{}) {
-			b.WriteString("\x1b[0m")
+			b = append(b, "\x1b[0m"...)
 			cur = styleState{}
 		}
 		if row < s.Rows-1 {
-			b.WriteByte('\n')
+			b = append(b, '\n')
 		}
 	}
-	return b.String()
+	return string(b)
 }
 
 // styleState mirrors the SGR state a cell parser holds. Zero value is the
@@ -98,34 +92,61 @@ type styleState struct {
 
 var attrSGR = []struct {
 	bit  uint16
-	code string
+	code byte // SGR codes for the attrs are all single digits
 }{
-	{pane.AttrBold, "1"},
-	{pane.AttrFaint, "2"},
-	{pane.AttrItalic, "3"},
-	{pane.AttrUnderline, "4"},
-	{pane.AttrStrikethrough, "9"},
-	{pane.AttrInverse, "7"},
+	{pane.AttrBold, '1'},
+	{pane.AttrFaint, '2'},
+	{pane.AttrItalic, '3'},
+	{pane.AttrUnderline, '4'},
+	{pane.AttrStrikethrough, '9'},
+	{pane.AttrInverse, '7'},
 }
 
-// sgrParams sets everything that differs from default. A reset is always
-// emitted before it, so nothing needs an explicit off code.
-func (s styleState) sgrParams() string {
-	var parts []string
+// appendSGR emits the transition to s straight into b: a reset, then one
+// SGR sequence when s sets anything. A reset always precedes it, so nothing
+// needs an explicit off code. Written as bytes, no strconv, no Join.
+func appendSGR(b []byte, s styleState) []byte {
+	b = append(b, "\x1b[0m"...)
+	mark := len(b)
+	b = append(b, "\x1b["...)
 	for _, a := range attrSGR {
 		if s.attr&a.bit != 0 {
-			parts = append(parts, a.code)
+			b = append(b, a.code, ';')
 		}
 	}
 	if s.fg != 0 {
-		parts = append(parts, "38;2;"+rgb(s.fg))
+		b = appendRGB(b, "38;2;", s.fg)
 	}
 	if s.bg != 0 {
-		parts = append(parts, "48;2;"+rgb(s.bg))
+		b = appendRGB(b, "48;2;", s.bg)
 	}
-	return strings.Join(parts, ";")
+	if len(b) == mark+2 {
+		return b[:mark] // nothing set: the reset alone restores the default
+	}
+	b[len(b)-1] = 'm' // the trailing ';' becomes the terminator
+	return b
 }
 
-func rgb(c uint32) string {
-	return strconv.Itoa(int(c>>16&0xff)) + ";" + strconv.Itoa(int(c>>8&0xff)) + ";" + strconv.Itoa(int(c&0xff))
+func appendRGB(b []byte, pfx string, c uint32) []byte {
+	b = append(b, pfx...)
+	b = appendUint(b, c>>16&0xff)
+	b = append(b, ';')
+	b = appendUint(b, c>>8&0xff)
+	b = append(b, ';')
+	b = appendUint(b, c&0xff)
+	return append(b, ';')
+}
+
+func appendUint(b []byte, v uint32) []byte {
+	if v == 0 {
+		return append(b, '0')
+	}
+	var tmp [10]byte // room for any uint32
+	i := len(tmp)
+	for v > 0 {
+		i--
+		tmp[i] = byte('0' + v%10)
+		v /= 10
+	}
+	return append(b, tmp[i:]...)
 }

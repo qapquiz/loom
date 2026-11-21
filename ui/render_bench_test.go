@@ -28,7 +28,7 @@ import (
 func benchPayload() []byte {
 	var b []byte
 	for row := 0; row < 60; row++ {
-		b = append(b, "\x1b[0m\x1b[38;5;" + itoa(17+row%200) + ";48;5;" + itoa(235+row%20) + "m"...)
+		b = append(b, "\x1b[0m\x1b[38;5;"+itoa(17+row%200)+";48;5;"+itoa(235+row%20)+"m"...)
 		if row%3 == 0 {
 			b = append(b, "\x1b[1m"...)
 		}

@@ -48,6 +48,7 @@ type Screen struct {
 	Title      string // last TitleChanged effect
 	Status     string // last ProgramStatus effect (OSC 7501); never screen-scraped
 	MouseOn    bool   // program owns the mouse: bloom's MouseMode/selection stand down
+	Scrolled   bool   // viewport is parked off the cursor in scrollback; only OpScrollBottom returns live
 }
 
 type OpKind uint8
@@ -58,6 +59,8 @@ const (
 	OpResize
 	OpActive
 	OpFacts
+	OpScrollDelta  // local viewport scroll; N lines, negative up
+	OpScrollBottom // return the viewport to the cursor (live tail)
 )
 
 // Key and Mouse are plain data on purpose: libghostty's KeyEvent/MouseEvent
@@ -85,6 +88,7 @@ type Op struct {
 	Rows   uint16
 	Active bool   // OpActive: loom became (or stopped being) the active viewer
 	Facts  string // OpFacts: raw Display JSON; the app owns the payload, the pane transports it (string keeps Op comparable, like Key.Text)
+	N      int    // OpScrollDelta: lines to scroll, negative up
 }
 
 // Pane implements hc.Stream. All emulator mutation happens on hc's read-loop
@@ -193,7 +197,7 @@ func (p *Pane) Delta(b []byte) {
 		return
 	}
 	p.emu.write(b)
-	p.publish()
+	p.publish(false)
 }
 
 func (p *Pane) Closed(r hc.CloseReason) {

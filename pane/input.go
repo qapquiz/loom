@@ -79,6 +79,23 @@ func (p *Pane) apply(op Op) {
 			return
 		}
 		p.out.Facts([]byte(op.Facts))
+	case OpScrollDelta, OpScrollBottom:
+		// Scroll is local to the emulator's viewport and never a wire write,
+		// so graft 4's phase gate does not apply: an exited pane keeps its
+		// content until restart and stays scrollable.
+		if p.emu == nil || p.emu.term == nil {
+			return
+		}
+		var err error
+		if op.Kind == OpScrollBottom {
+			err = p.emu.term.ScrollViewportBottom()
+		} else {
+			err = p.emu.term.ScrollViewportDelta(op.N)
+		}
+		if err != nil {
+			return
+		}
+		p.publish(true) // scrolling may not mark dirty; the rows moved anyway
 	}
 }
 

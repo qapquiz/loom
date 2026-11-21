@@ -35,6 +35,18 @@ func (n *PaneNode) View() string {
 	return n.view
 }
 
+// scrollbackMark is the scrolled indicator: drawn over the top-right cells
+// of row 0 while the viewport is parked in scrollback. scrollMarkStyle is a
+// fixed inverse style so it reads as a marker over whatever content sits
+// underneath. All marker cells are single-width, so a wide head just before
+// the zone is simply overwritten (its tail column becomes marker text);
+// scrollbackMarkCells is the rune slice because '↑' is three UTF-8 bytes.
+const scrollbackMark = " ↑ scrollback"
+
+var scrollbackMarkCells = []rune(scrollbackMark)
+
+var scrollMarkStyle = styleState{attr: pane.AttrInverse}
+
 // renderScreen rows join with \n, each exactly Cols cells wide: a wide rune
 // is one glyph whose tail spacer column is skipped, because a cell-based
 // parser gives the glyph two columns. The cursor cell renders inverse so the
@@ -49,10 +61,22 @@ func renderScreen(s *pane.Screen) string {
 	// plus a memcpy the emit pass already paid for once.
 	b := make([]byte, 0, sizeScreen(s))
 	cur := styleState{}
+	markStart := s.Cols // no marker: col >= Cols never fires
+	if s.Scrolled && s.Cols >= len(scrollbackMarkCells) {
+		markStart = s.Cols - len(scrollbackMarkCells)
+	}
 	for row := 0; row < s.Rows; row++ {
 		skip := false
 		base := row * s.Cols
 		for col := 0; col < s.Cols; col++ {
+			if row == 0 && col >= markStart {
+				if scrollMarkStyle != cur {
+					b = appendSGR(b, scrollMarkStyle)
+					cur = scrollMarkStyle
+				}
+				b = append(b, string(scrollbackMarkCells[col-markStart])...)
+				continue
+			}
 			c := s.Cells[base+col]
 			if skip {
 				skip = false
@@ -96,9 +120,21 @@ func sizeScreen(s *pane.Screen) int {
 	n := s.Rows * 5 // a newline plus at most one 4-byte row-end reset per row
 	transitions := 0
 	cur := styleState{}
+	markStart := s.Cols // no marker: col >= Cols never fires
+	if s.Scrolled && s.Cols >= len(scrollbackMarkCells) {
+		markStart = s.Cols - len(scrollbackMarkCells)
+	}
 	for row := 0; row < s.Rows; row++ {
 		base := row * s.Cols
 		for col := 0; col < s.Cols; col++ {
+			if row == 0 && col >= markStart {
+				n += 3 // marker cell bytes: most are 1, '↑' is 3 UTF-8 bytes
+				if scrollMarkStyle != cur {
+					transitions++
+					cur = scrollMarkStyle
+				}
+				continue
+			}
 			c := s.Cells[base+col]
 			n += len(c.Text) + 1 // cluster bytes, or the space when empty
 			want := styleState{fg: c.S.FG, bg: c.S.BG, attr: c.S.Attr}

@@ -168,8 +168,10 @@ func statusWord(s libghostty.ProgramStatusState) string {
 
 // publish snapshots the render state into an immutable Screen (graft 3: the
 // publish is skipped entirely when ghostty reports the frame clean — idle
-// panes cost nothing).
-func (p *Pane) publish() {
+// panes cost nothing). force bypasses that skip: viewport scrolling may not
+// mark the frame dirty, but the rows the iterator yields have changed, so
+// the scroll ops pay a publish unconditionally.
+func (p *Pane) publish(force bool) {
 	e := p.emu
 	if e == nil || e.rs == nil || e.term == nil {
 		return
@@ -177,8 +179,10 @@ func (p *Pane) publish() {
 	if err := e.rs.Update(e.term); err != nil {
 		return
 	}
-	if dirty, err := e.rs.Dirty(); err == nil && dirty == libghostty.RenderStateDirtyFalse {
-		return
+	if !force {
+		if dirty, err := e.rs.Dirty(); err == nil && dirty == libghostty.RenderStateDirtyFalse {
+			return
+		}
 	}
 	// Encoder modes (application cursor keys, kitty flags, mouse tracking)
 	// come from the terminal itself; resync after every Update.
@@ -220,6 +224,11 @@ func (p *Pane) publish() {
 			Row:     int(cur.ViewportY),
 			Visible: cur.ViewportHasValue && cur.Visible,
 		}
+		// Scrolled truth: a cursor exists but sits outside the viewport. A
+		// failed cursor read is no-cursor, not scrolled. While scrolled the
+		// viewport stays anchored — publish keeps rendering history rows and
+		// this flag stays true until OpScrollBottom runs.
+		screen.Scrolled = !cur.ViewportHasValue
 	}
 	if on, err := e.term.MouseTracking(); err == nil {
 		screen.MouseOn = on

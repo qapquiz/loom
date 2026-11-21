@@ -102,6 +102,9 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Code == 'q' && msg.Mod&tea.ModCtrl != 0 {
 			return a, tea.Quit
 		}
+		if (msg.Code == tea.KeyPgUp || msg.Code == tea.KeyPgDown) && a.scrollPage(msg.Code) {
+			break // scrollback owns the key; the pane never sees it
+		}
 		if a.pane != nil {
 			a.pane.Enqueue(pane.Op{Kind: pane.OpKey, Key: toPaneKey(tea.Key(msg))})
 		}
@@ -110,7 +113,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.pane.Enqueue(pane.Op{Kind: pane.OpKey, Key: pane.Key{Text: msg.Content}})
 		}
 	case tea.MouseClickMsg, tea.MouseReleaseMsg, tea.MouseMotionMsg, tea.MouseWheelMsg:
-		a.forwardMouse(msg.(tea.MouseMsg))
+		a.routeMouse(msg.(tea.MouseMsg))
 	case tea.FocusMsg:
 		a.focused = true
 		if a.pane != nil {
@@ -295,6 +298,65 @@ func (a *App) postSize(w, h int) {
 	}
 }
 
+// routeMouse lets wheel events over the pane drive loom's scrollback while
+// the program inside does not own the mouse; everything else — and every
+// mouse event while the program owns it — forwards as before.
+func (a *App) routeMouse(msg tea.MouseMsg) {
+	if w, ok := msg.(tea.MouseWheelMsg); ok && a.scrollWheel(w) {
+		return
+	}
+	a.forwardMouse(msg)
+}
+
+// wheelLines is the scroll step per wheel event, the three-line xterm
+// convention.
+const wheelLines = 3
+
+// scrollWheel turns one wheel event over the pane rect into a scrollback op
+// when the program does not own the mouse. Reports whether it consumed the
+// event.
+func (a *App) scrollWheel(w tea.MouseWheelMsg) bool {
+	if a.pane == nil {
+		return false
+	}
+	if s := a.pane.Screen(); s == nil || s.MouseOn {
+		return false
+	}
+	if !a.mouseOverPane(w.Mouse()) {
+		return false
+	}
+	n := -wheelLines
+	if w.Button == tea.MouseWheelDown {
+		n = wheelLines
+	}
+	a.pane.Enqueue(pane.Op{Kind: pane.OpScrollDelta, N: n})
+	return true
+}
+
+// scrollPage pages the pane's scrollback on PageUp/PageDown while the
+// program does not own the mouse; with it owned the page keys stay program
+// keys, exactly as before. The page is the pane's own Rows. Reports whether
+// it consumed the key.
+func (a *App) scrollPage(code rune) bool {
+	if a.pane == nil {
+		return false
+	}
+	s := a.pane.Screen()
+	if s == nil || s.MouseOn {
+		return false
+	}
+	page := s.Rows
+	if page < 1 {
+		page = 1
+	}
+	n := -page
+	if code == tea.KeyPgDown {
+		n = page
+	}
+	a.pane.Enqueue(pane.Op{Kind: pane.OpScrollDelta, N: n})
+	return true
+}
+
 // forwardMouse maps a screen event to pane-relative cells and forwards it
 // only while the program inside owns the mouse; otherwise the event belongs
 // to the terminal's own selection and the pane stands down.
@@ -306,15 +368,24 @@ func (a *App) forwardMouse(msg tea.MouseMsg) {
 	if s == nil || !s.MouseOn {
 		return
 	}
+	if !a.mouseOverPane(msg.Mouse()) {
+		return
+	}
 	r, ok := a.ui.Frame().Rect(paneRect)
 	if !ok {
 		return
 	}
 	m := msg.Mouse()
-	if m.X < r.Min.X || m.X >= r.Max.X || m.Y < r.Min.Y || m.Y >= r.Max.Y {
-		return
-	}
 	a.pane.Enqueue(mouseToOp(msg, m.X-r.Min.X, m.Y-r.Min.Y))
+}
+
+// mouseOverPane reports whether a screen point sits inside the pane rect.
+func (a *App) mouseOverPane(m tea.Mouse) bool {
+	r, ok := a.ui.Frame().Rect(paneRect)
+	if !ok {
+		return false
+	}
+	return m.X >= r.Min.X && m.X < r.Max.X && m.Y >= r.Min.Y && m.Y < r.Max.Y
 }
 
 func (a *App) layout() bloom.Child {

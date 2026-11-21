@@ -149,9 +149,9 @@ func listSize(name string) (cols, rows uint16, ok bool) {
 	var msg struct {
 		Result struct {
 			Terminals []struct {
-				Name string  `json:"name"`
-				Cols uint16  `json:"cols"`
-				Rows uint16  `json:"rows"`
+				Name string `json:"name"`
+				Cols uint16 `json:"cols"`
+				Rows uint16 `json:"rows"`
 			} `json:"terminals"`
 		} `json:"result"`
 	}

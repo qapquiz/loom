@@ -64,10 +64,10 @@ func plainText(s *pane.Screen) string {
 			continue
 		}
 		skip = c.Wide
-		if c.R == 0 {
+		if c.Text == "" {
 			b.WriteByte(' ')
 		} else {
-			b.WriteRune(c.R)
+			b.WriteString(c.Text)
 		}
 	}
 	return b.String()

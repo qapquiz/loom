@@ -20,11 +20,11 @@ func blankScreen(w, h int) *pane.Screen {
 func putLine(s *pane.Screen, row, col int, text string, st pane.Style) {
 	for _, r := range text {
 		if r >= 0x4E00 && r <= 0x9FFF { // the CJK range the tests use
-			s.Cells[row*s.Cols+col] = pane.Cell{R: r, S: st, Wide: true}
+			s.Cells[row*s.Cols+col] = pane.Cell{Text: string(r), S: st, Wide: true}
 			col += 2
 			continue
 		}
-		s.Cells[row*s.Cols+col] = pane.Cell{R: r, S: st}
+		s.Cells[row*s.Cols+col] = pane.Cell{Text: string(r), S: st}
 		col++
 	}
 }

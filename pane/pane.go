@@ -13,7 +13,10 @@ import (
 )
 
 type Cell struct {
-	R    rune
+	// Text is the cell's full UTF-8 grapheme cluster, base codepoint first
+	// with combining marks riding inside it; empty means blank, rendered as
+	// a space.
+	Text string
 	S    Style
 	Wide bool // head cell of a double-width rune; the tail spacer reads as empty
 }

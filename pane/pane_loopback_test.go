@@ -55,11 +55,11 @@ func screenText(s *Screen) string {
 				line = append(line, '\x00')
 				continue
 			}
-			r := c.R
-			if r == 0 {
-				r = ' '
+			text := c.Text
+			if text == "" {
+				text = " "
 			}
-			line = append(line, r)
+			line = append(line, []rune(text)...)
 			skipTail = c.Wide
 		}
 		// Wide tails are the only '\x00' cells; collapse them out.

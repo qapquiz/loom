@@ -83,7 +83,7 @@ func BenchmarkRenderScreen(b *testing.B) {
 	for row := 0; row < 60; row++ {
 		for col := 0; col < 200; col++ {
 			c := &s.Cells[row*200+col]
-			c.R = rune('a' + (row+col)%26)
+			c.Text = string(rune('a' + (row+col)%26))
 			c.S.FG = uint32(0x100000 + row*0x1000)
 			c.S.BG = uint32(0x010000 + col*0x100)
 			if row%3 == 0 {

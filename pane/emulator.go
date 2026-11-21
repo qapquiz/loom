@@ -5,6 +5,8 @@ package pane
 // single-goroutine contract.
 
 import (
+	"strings"
+
 	"go.mitchellh.com/libghostty"
 )
 
@@ -221,18 +223,43 @@ func (p *Pane) publish() {
 	p.wakeOnce()
 }
 
+// asciiCellText interns the single-ASCII-byte cluster strings so the common
+// screen content costs no allocation per cell.
+var asciiCellText = func() [128]string {
+	var a [128]string
+	for i := range a {
+		a[i] = string(rune(i))
+	}
+	return a
+}()
+
+// graphemeScratch is reused across cells; readCell runs only on the session
+// goroutine.
+var graphemeScratch = make([]uint32, 0, 8)
+
 func readCell(rc *libghostty.RenderStateRowCells) Cell {
 	c := Cell{}
-	// Per-cell reads are confirmed on the pinned bindings: Raw/Codepoint/Wide
-	// on RenderStateRowCells, valid until the next Update; the values read
-	// here are copied and retained in the Screen.
-	if cp, err := rc.Raw(); err == nil && cp != nil {
-		if codepoint, err := cp.Codepoint(); err == nil {
-			c.R = rune(codepoint)
+	cp, err := rc.Raw()
+	if err != nil {
+		return c
+	}
+	// Blanks skip the grapheme read: on real screens they dominate.
+	if hasText, err := cp.HasText(); err == nil && hasText {
+		cps, err := rc.GraphemesInto(graphemeScratch[:0])
+		if err == nil && len(cps) > 0 {
+			if len(cps) == 1 && cps[0] < 128 {
+				c.Text = asciiCellText[cps[0]]
+			} else {
+				var b strings.Builder
+				for _, r := range cps {
+					b.WriteRune(rune(r))
+				}
+				c.Text = b.String()
+			}
 		}
-		if wide, err := cp.Wide(); err == nil && wide == libghostty.CellWideWide {
-			c.Wide = true
-		}
+	}
+	if wide, err := cp.Wide(); err == nil && wide == libghostty.CellWideWide {
+		c.Wide = true
 	}
 	var snap libghostty.RenderCellStyle
 	if err := rc.StyleInto(&snap); err == nil {

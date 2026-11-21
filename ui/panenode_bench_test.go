@@ -18,11 +18,11 @@ func benchScreen() *pane.Screen {
 		for col := 0; col < s.Cols; col++ {
 			switch {
 			case col%37 == 0:
-				s.Cells[base+col] = pane.Cell{R: '世', S: style, Wide: true}
+				s.Cells[base+col] = pane.Cell{Text: "世", S: style, Wide: true}
 			case col%5 == 0:
-				s.Cells[base+col] = pane.Cell{R: rune('a' + col%26), S: style}
+				s.Cells[base+col] = pane.Cell{Text: string(rune('a' + col%26)), S: style}
 			default:
-				s.Cells[base+col] = pane.Cell{R: rune('a' + col%26)}
+				s.Cells[base+col] = pane.Cell{Text: string(rune('a' + col%26))}
 			}
 		}
 	}

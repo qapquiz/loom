@@ -71,10 +71,10 @@ func renderScreen(s *pane.Screen) string {
 				}
 				cur = want
 			}
-			if c.R == 0 {
+			if c.Text == "" {
 				b.WriteByte(' ')
 			} else {
-				b.WriteRune(c.R)
+				b.WriteString(c.Text)
 			}
 		}
 		// End every styled run at the row edge so lines stay independent.

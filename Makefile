@@ -19,7 +19,7 @@ LD_LIBRARY_PATH := $(CURDIR)/$(LIBGHOSTTY_PREFIX)/lib
 # changing GHOSTTY_SHA re-fetches and rebuilds.
 DEPS_STAMP := $(BUILD_DIR)/.deps-$(GHOSTTY_SHA)
 
-.PHONY: deps build test run clean
+.PHONY: deps build test live-test run verify clean
 
 deps: $(DEPS_STAMP)
 
@@ -41,6 +41,14 @@ build: $(DEPS_STAMP)
 test: $(DEPS_STAMP)
 	PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) LD_LIBRARY_PATH=$(LD_LIBRARY_PATH) \
 		go test -race ./...
+
+# Live gates need a running core; without LOOM_TEST_HC=1 they skip, so plain
+# `make test` is skip-green for them and must never be cited as live evidence.
+live-test:
+	LOOM_TEST_HC=1 PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) LD_LIBRARY_PATH=$(LD_LIBRARY_PATH) \
+		go test -race -count=1 ./...
+
+verify: test live-test
 
 run: $(DEPS_STAMP)
 	PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) LD_LIBRARY_PATH=$(LD_LIBRARY_PATH) \

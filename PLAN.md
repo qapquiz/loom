@@ -37,7 +37,7 @@ Each unit ends in a check before the next starts.
 ## M2 queue, ordered by run-end evidence
 
 1. DONE (hillclimb, 5 iterations, 3 kept): dense assembly 2.55 ms -> 0.47 ms (-81%, 92,428 -> 2 allocs, 3.6 -> 1.06 MB); typical 0.38 -> 0.16 ms; idle unchanged at 0 allocs. A dense changed frame is now ~1.2 ms total with publish and parse, 15% of the 8.33 ms budget; two busy panes now fit at 120 fps. Parked for M2: hint-based sizing (needs a steady-state bench first, /tmp/hc5-hint-sizing.patch), kitty key releases (in git stash, unreviewed).
-2. Live-gated integration tests. Grow LOOM_TEST_HC=1 tests from cmd/loomprobe (dial, snapshot, attach, first paint, resize). Live behavior currently rests on manual captures, which do not rerun.
-3. FACTS with real cell pixels. The synthetic 1x1 MouseEncoder size makes pixel-geometry queries (CSI 14t/16t) misreport. Send display facts per hc's FACTS frame.
-4. Build story. The lib depends on a sibling repo's untracked build dir via PKG_CONFIG_PATH. Vendor the built lib or add a Makefile target that builds it pinned.
-5. Multi-pane perf re-check after item 1, splits and tabs, scrollback viewing.
+2. DONE: hc/live_test.go, four live-gated tests (snapshot by name, attach+paint+autoInput, typed echo e2e, resize), double-green plus 10/10 post-race-fix; subscribe-window feed race found and fixed (5bed340); final commit live-gated post-audit.
+3. DONE in two phases: c8dfd58 documented that no honest px source exists in the stack (pixel queries answered with silence, not misreports) and 2b99d58 built the source: own TIOCGWINSZ, real cell px into Resize/SetSize/SetEffectSize, FACTS Display {cell:[w,h]} on the wire; 1x1 survives only where the tty reports no pixels.
+4. DONE: make deps pins ghostty 5813c94 and builds via zig ReleaseFast (flag mapping from upstream CMake), fresh-prefix verified; local-lib builds confirmed. make test is skip-green for live gates; use make live-test.
+5. Multi-pane perf re-check absorbed by the hillclimb ledger (two dense panes ~1.2ms each fit the 8.33ms budget). NEXT RUN: splits and tabs, scrollback viewing, parked candidates (kitty key-release stash, hint-sizing patch with a steady-state bench).

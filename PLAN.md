@@ -36,7 +36,7 @@ Each unit ends in a check before the next starts.
 
 ## M2 queue, ordered by run-end evidence
 
-1. SGR assembly hillclimb, dense churn only. Typical styled runs (vim-shaped, transitions on change) assemble in 0.375 ms; a typical changed frame is about 1.1 ms, 13% of budget. The dense-churn worst case is 2.55 ms and allocation-bound (92k allocs, 3.6 MB), 40% of budget with parse included. Cache SGR per style, append bytes directly, emit fewer resets. All legs benchmarked and independently reproduced.
+1. DONE (hillclimb, 5 iterations, 3 kept): dense assembly 2.55 ms -> 0.47 ms (-81%, 92,428 -> 2 allocs, 3.6 -> 1.06 MB); typical 0.38 -> 0.16 ms; idle unchanged at 0 allocs. A dense changed frame is now ~1.2 ms total with publish and parse, 15% of the 8.33 ms budget; two busy panes now fit at 120 fps. Parked for M2: hint-based sizing (needs a steady-state bench first, /tmp/hc5-hint-sizing.patch), kitty key releases (in git stash, unreviewed).
 2. Live-gated integration tests. Grow LOOM_TEST_HC=1 tests from cmd/loomprobe (dial, snapshot, attach, first paint, resize). Live behavior currently rests on manual captures, which do not rerun.
 3. FACTS with real cell pixels. The synthetic 1x1 MouseEncoder size makes pixel-geometry queries (CSI 14t/16t) misreport. Send display facts per hc's FACTS frame.
 4. Build story. The lib depends on a sibling repo's untracked build dir via PKG_CONFIG_PATH. Vendor the built lib or add a Makefile target that builds it pinned.

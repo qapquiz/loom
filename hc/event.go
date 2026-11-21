@@ -5,7 +5,10 @@ package hc
 // doc) are dropped here because the synthesis vocabulary has no slot for them
 // and nothing in wave 1 renders them — seq still advances past them.
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"sync"
+)
 
 type TerminalID string
 
@@ -76,12 +79,27 @@ type eventSnapshotJSON struct {
 }
 
 type eventFeed struct {
+	mu      sync.Mutex
 	lastSeq uint64
 	primed  bool // seq comparisons are meaningless before the first snapshot
 }
 
 // snapshot seeds lastSeq from a subscribe reply or missed notification.
+// The read loop and the DialConn goroutine touch the feed concurrently
+// during the subscribe window, so the feed carries its own lock.
 func (f *eventFeed) snapshot(seq uint64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.snapshotLocked(seq)
+}
+
+func (f *eventFeed) snapshotLocked(seq uint64) {
+	// An event applied during the subscribe window already advanced the
+	// watermark past the reply's seq; the snapshot is state as of that seq,
+	// so the watermark never moves backward.
+	if f.primed && seq < f.lastSeq {
+		return
+	}
 	f.lastSeq = seq
 	f.primed = true
 }
@@ -90,9 +108,11 @@ func (f *eventFeed) snapshot(seq uint64) {
 // above the last known seq are dropped; a missed notification becomes one
 // wholesale EventSnapshot and resets the baseline.
 func (f *eventFeed) note(n eventNote) []Event {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	switch n.Method {
 	case "heartbeat":
-		if !f.fresh(n.Params.Seq) {
+		if !f.freshLocked(n.Params.Seq) {
 			return nil
 		}
 		return []Event{{Kind: EventKeep, Seq: n.Params.Seq}}
@@ -101,14 +121,14 @@ func (f *eventFeed) note(n eventNote) []Event {
 		if err := json.Unmarshal(n.Params.Terminals, &snap.Terminals); err != nil {
 			return nil
 		}
-		f.snapshot(n.Params.Seq)
+		f.snapshotLocked(n.Params.Seq)
 		ev := Event{Kind: EventSnapshot, Seq: n.Params.Seq}
 		for _, rec := range snap.Terminals {
 			ev.All = append(ev.All, rec.info())
 		}
 		return []Event{ev}
 	case "event":
-		if !f.fresh(n.Params.Seq) {
+		if !f.freshLocked(n.Params.Seq) {
 			return nil
 		}
 		return mapEvent(n.Params)
@@ -117,7 +137,7 @@ func (f *eventFeed) note(n eventNote) []Event {
 	}
 }
 
-func (f *eventFeed) fresh(seq uint64) bool {
+func (f *eventFeed) freshLocked(seq uint64) bool {
 	if f.primed && seq <= f.lastSeq {
 		return false
 	}

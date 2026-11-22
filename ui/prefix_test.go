@@ -28,7 +28,7 @@ func TestAppPrefixStateMachine(t *testing.T) {
 		{"passthrough forwards", []tea.KeyPressMsg{{Code: 'x', Text: "x"}}, modePassthrough, "x", 0, false},
 		{"prefix swallows itself", []tea.KeyPressMsg{ctrlB}, modePrefix, "", 0, false},
 		{"prefix then bound split runs", []tea.KeyPressMsg{ctrlB, {Code: 'v', Text: "v"}}, modePassthrough, "", 1, false},
-		{"prefix then bound chooser is inert", []tea.KeyPressMsg{ctrlB, {Code: 'w', Text: "w"}}, modePassthrough, "", 0, false},
+		{"prefix then bound chooser opens it", []tea.KeyPressMsg{ctrlB, {Code: 'w', Text: "w"}}, modeChooser, "", 0, false},
 		{"prefix drops unbound key", []tea.KeyPressMsg{ctrlB, {Code: 'z', Text: "z"}}, modePassthrough, "", 0, false},
 		{"prefix passes exactly one key", []tea.KeyPressMsg{ctrlB, {Code: 'z', Text: "z"}, {Code: 'x', Text: "x"}}, modePassthrough, "x", 0, false},
 		{"double prefix sends literal 0x02", []tea.KeyPressMsg{ctrlB, ctrlB}, modePassthrough, "\x02", 0, false},

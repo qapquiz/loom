@@ -24,7 +24,7 @@ func wirePane(tb testing.TB) (*testcore.Core, *hc.Session, *pane.Pane) {
 	tb.Cleanup(func() { sess.Close() })
 	p := pane.New("t7", nil)
 	p.SetPump(sess.Do)
-	p.SetAttachFn(func() { sess.Attach("t7", hcStream{p: p}) })
+	p.SetAttachFn(func() { sess.Attach("t7", &hcStream{p: p}) })
 	return core, sess, p
 }
 

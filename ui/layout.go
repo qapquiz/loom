@@ -20,7 +20,7 @@ type inputMode uint8
 const (
 	modePassthrough inputMode = iota
 	modePrefix
-	modeChooser // wave 2: cmdChooseWindow enters it; nothing does yet
+	modeChooser // <leader> w's window list: owns every key until it closes
 )
 
 // command is what a bound key means. The enum, not the rune, is the
@@ -31,7 +31,7 @@ type command uint8
 const (
 	cmdSplitVertical   command = iota // 'v': side-by-side halves (Row)
 	cmdSplitHorizontal                // '-': stacked halves (Column)
-	cmdChooseWindow                   // 'w': wave 2 chooser; bound but inert
+	cmdChooseWindow                   // 'w': the window chooser over the room's terminals
 )
 
 // bindings is the single source of key meaning: rune to command. Shifted
@@ -75,8 +75,9 @@ type paneSlot struct {
 	p    *pane.Pane
 	node *PaneNode
 
-	sentW, sentH int  // last size posted from solved frame geometry
-	liveSeen     bool // first live wake paid this pane's FOCUS/facts debts yet
+	stream       *hcStream // the slot's stream adapter: Detach is the chooser's clean CLOSE
+	sentW, sentH int       // last size posted from solved frame geometry
+	liveSeen     bool      // first live wake paid this pane's FOCUS/facts debts yet
 }
 
 // child renders the subtree as bloom children: leaf slots are Fill cells
@@ -107,6 +108,23 @@ func (n *layoutNode) split(id hc.TerminalID, fresh *layoutNode, vert bool) bool 
 		return true
 	}
 	return n.b.split(id, fresh, vert)
+}
+
+// replace swaps the pane held by the leaf with the given id and reports
+// whether the tree changed. The chooser's fresh-attach path uses it: the
+// slot's geometry and siblings stay, only the pane behind the leaf swaps.
+func (n *layoutNode) replace(id hc.TerminalID, fresh *paneSlot) bool {
+	if n.leaf != nil {
+		if n.leaf.id != id {
+			return false
+		}
+		n.leaf = fresh
+		return true
+	}
+	if n.a.replace(id, fresh) {
+		return true
+	}
+	return n.b.replace(id, fresh)
 }
 
 // leaves walks the tree's slots in layout order (a before b).

@@ -8,6 +8,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"bloomfx.dev/bloom"
+	"bloomfx.dev/bloom/fx"
 	"golang.org/x/sys/unix"
 
 	"loom/hc"
@@ -28,6 +29,8 @@ type App struct {
 	panes map[hc.TerminalID]*paneSlot // every open slot, by terminal id
 	focus hc.TerminalID               // the pane keys and paste go to
 	mode  inputMode                   // keyboard state machine
+
+	chooser *chooserState // the open window chooser; non-nil iff mode == modeChooser
 
 	wake          chan struct{}
 	width, height int
@@ -124,11 +127,16 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // from any mode. In prefix mode the key is swallowed either way: bound →
 // command, unbound → dropped, second ctrl+b → a literal 0x02 forwarded to
 // the focused pane (tmux semantics). ctrl+b enters prefix only from
-// passthrough — the chooser owns its keys and ignores the prefix machinery.
+// passthrough — the chooser owns its keys and swallows all of them: nothing
+// reaches the panes, and the prefix machinery never nests inside it.
 func (a *App) key(msg tea.KeyPressMsg) tea.Cmd {
 	if msg.Code == 'q' && msg.Mod&tea.ModCtrl != 0 {
 		a.mode = modePassthrough
 		return tea.Quit
+	}
+	if a.mode == modeChooser {
+		a.chooserKey(msg)
+		return nil
 	}
 	if a.mode == modePrefix {
 		a.mode = modePassthrough
@@ -154,7 +162,7 @@ func (a *App) key(msg tea.KeyPressMsg) tea.Cmd {
 
 // runCommand executes one bound command. Splits spawn a shell in a new
 // terminal and graft it beside the focused pane once Run answers; the
-// chooser is wave 2's mode and inert here.
+// chooser opens its window list over the pane area.
 func (a *App) runCommand(cmd command) tea.Cmd {
 	switch cmd {
 	case cmdSplitVertical:
@@ -162,7 +170,7 @@ func (a *App) runCommand(cmd command) tea.Cmd {
 	case cmdSplitHorizontal:
 		return a.split(false)
 	case cmdChooseWindow:
-		// wave 2: modeChooser and the window list over the room
+		a.openChooser()
 	}
 	return nil
 }
@@ -219,8 +227,14 @@ func (a *App) setFocus(id hc.TerminalID) {
 }
 
 func (a *App) onEvent(ev hc.Event) {
-	if a.room.Apply(ev) && a.tree == nil {
-		a.attachFirst()
+	changed := a.room.Apply(ev)
+	if changed {
+		if a.tree == nil {
+			a.attachFirst()
+		}
+		if a.chooser != nil {
+			a.chooser.refresh(&a.room, a.openPanes()) // the list is live while open
+		}
 	}
 	s := a.panes[ev.ID]
 	if s == nil {
@@ -283,6 +297,18 @@ func pickAttach(r *room.Room, want string) hc.TerminalID {
 	return ""
 }
 
+// newSlot builds one pane slot for id: the pane, its stream adapter and its
+// bloom leaf, wired to the session exactly like every other pane. addPane
+// splits it in beside the focus; replaceFocused swaps it into the focused
+// leaf; the wiring is one shape either way.
+func (a *App) newSlot(id hc.TerminalID) *paneSlot {
+	p := pane.New(string(id), a.notify)
+	p.SetPump(a.sess.Do)
+	st := &hcStream{p: p}
+	p.SetAttachFn(func() { a.sess.Attach(id, st) })
+	return &paneSlot{id: id, p: p, node: NewPaneNode(p), stream: st}
+}
+
 // addPane grafts a terminal into the tree — the first pane becomes the
 // whole tree, later ones split the focused leaf — and focuses it. The
 // room's created event follows on its own; the attach goes straight to the
@@ -294,10 +320,7 @@ func (a *App) addPane(id hc.TerminalID, vert bool) {
 	if _, dup := a.panes[id]; dup {
 		return
 	}
-	p := pane.New(string(id), a.notify)
-	p.SetPump(a.sess.Do)
-	p.SetAttachFn(func() { a.sess.Attach(id, hcStream{p: p}) })
-	s := &paneSlot{id: id, p: p, node: NewPaneNode(p)}
+	s := a.newSlot(id)
 	a.panes[id] = s
 	if a.tree == nil {
 		a.tree = &layoutNode{leaf: s}
@@ -305,6 +328,7 @@ func (a *App) addPane(id hc.TerminalID, vert bool) {
 		a.tree.split(a.focus, &layoutNode{leaf: s}, vert)
 	}
 	a.setFocus(id)
+	p := s.p
 	p.Change(pane.ChangeAttach)
 	// The attach's standing debts, the same ones the first pane pays: the
 	// cell px the pane was born without, and the size that predates the
@@ -520,6 +544,14 @@ func (a *App) layout() bloom.Child {
 	body := bloom.Child(bloom.Text("attaching…"))
 	if a.tree != nil {
 		body = a.tree.child()
+	}
+	if a.chooser != nil {
+		// The chooser is a centered layer over the pane area, not a full
+		// modal: the panes keep rendering beneath a light dim, and the
+		// sidebar stays bright beside it.
+		body = bloom.Overlay(body,
+			bloom.Layer(bloom.Text(a.chooser.view(a))).
+				Margin(1).Backdrop(fx.Dim{Amount: chooserDim}))
 	}
 	return bloom.Column(
 		bloom.Fill(

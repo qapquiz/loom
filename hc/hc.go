@@ -218,6 +218,32 @@ func (s *Session) Attach(id TerminalID, in Stream) {
 	})
 }
 
+// Run starts a program in a new terminal (terminal.run, schema 0.1.21) and
+// returns the new terminal's address. argv nil or empty means the core's own
+// shell; cwd names the working directory (pass $HOME for the shell default
+// a fresh split wants). wait stays false — the call answers once the program
+// runs, the record itself arrives on the events subscription, and the caller
+// attaches by the returned id without racing the room.
+func (s *Session) Run(argv []string, cwd string) (TerminalID, error) {
+	res, err := s.call("terminal.run", struct {
+		Argv []string `json:"argv,omitempty"`
+		Cwd  string   `json:"cwd,omitempty"`
+	}{argv, cwd})
+	if err != nil {
+		return "", err
+	}
+	var out struct {
+		Address string `json:"address"`
+	}
+	if err := json.Unmarshal(res, &out); err != nil {
+		return "", fmt.Errorf("hc: terminal.run result: %w", err)
+	}
+	if out.Address == "" {
+		return "", fmt.Errorf("hc: terminal.run result carried no address")
+	}
+	return TerminalID(out.Address), nil
+}
+
 func (s *Session) Close() error {
 	s.closeOnce.Do(func() { close(s.closed) })
 	return s.conn.Close()

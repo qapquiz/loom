@@ -70,20 +70,21 @@ func waitMouseOn(t *testing.T, a *App) {
 
 func TestAppAutoAttachesFirstListed(t *testing.T) {
 	_, a := newApp(t, `[{"address":"t7","title":"vim","cols":80,"rows":24}]`)
-	if a.pane == nil || a.active != "t7" {
-		t.Fatalf("pane = %v active = %v", a.pane, a.active)
+	s := a.panes["t7"]
+	if s == nil || a.focus != "t7" {
+		t.Fatalf("slot = %v focus = %v", s, a.focus)
 	}
-	if !waitForPhase(t, a.pane, 2*time.Second, pane.StateAttached) {
-		t.Fatalf("phase = %v", a.pane.Phase())
+	if !waitForPhase(t, s.p, 2*time.Second, pane.StateAttached) {
+		t.Fatalf("phase = %v", s.p.Phase())
 	}
-	if a.node == nil {
+	if s.node == nil {
 		t.Fatal("pane node missing")
 	}
 }
 
 func TestAppKeyRouteToData(t *testing.T) {
 	c, a := newApp(t, `[{"address":"t7","title":"vim","cols":80,"rows":24}]`)
-	if !waitForPhase(t, a.pane, 2*time.Second, pane.StateAttached) {
+	if !waitForPhase(t, a.panes["t7"].p, 2*time.Second, pane.StateAttached) {
 		t.Fatal("no attach")
 	}
 	a.Update(tea.KeyPressMsg{Code: 'x', Text: "x"})
@@ -110,7 +111,7 @@ func TestAppCtrlQQuits(t *testing.T) {
 
 func TestAppResizeFromFrameGeometry(t *testing.T) {
 	c, a := newApp(t, `[{"address":"t7","title":"vim","cols":80,"rows":24}]`)
-	if !waitForPhase(t, a.pane, 2*time.Second, pane.StateAttached) {
+	if !waitForPhase(t, a.panes["t7"].p, 2*time.Second, pane.StateAttached) {
 		t.Fatal("no attach")
 	}
 	// 100 wide minus the 20-cell sidebar leaves the pane 80x30.
@@ -132,7 +133,7 @@ func TestAppResizeFromFrameGeometry(t *testing.T) {
 
 func TestAppMouseModeFollowsPaneOwnership(t *testing.T) {
 	c, a := newApp(t, `[{"address":"t7","title":"vim","cols":80,"rows":24}]`)
-	if !waitForPhase(t, a.pane, 2*time.Second, pane.StateAttached) {
+	if !waitForPhase(t, a.panes["t7"].p, 2*time.Second, pane.StateAttached) {
 		t.Fatal("no attach")
 	}
 	a.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
@@ -148,7 +149,7 @@ func TestAppMouseModeFollowsPaneOwnership(t *testing.T) {
 
 func TestAppMouseDroppedWhenProgramDoesNotOwnIt(t *testing.T) {
 	c, a := newApp(t, `[{"address":"t7","title":"vim","cols":80,"rows":24}]`)
-	if !waitForPhase(t, a.pane, 2*time.Second, pane.StateAttached) {
+	if !waitForPhase(t, a.panes["t7"].p, 2*time.Second, pane.StateAttached) {
 		t.Fatal("no attach")
 	}
 	a.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
@@ -165,14 +166,14 @@ func TestAppMouseDroppedWhenProgramDoesNotOwnIt(t *testing.T) {
 
 func TestAppMouseRoutingBoundary(t *testing.T) {
 	c, a := newApp(t, `[{"address":"t7","title":"vim","cols":80,"rows":24}]`)
-	if !waitForPhase(t, a.pane, 2*time.Second, pane.StateAttached) {
+	if !waitForPhase(t, a.panes["t7"].p, 2*time.Second, pane.StateAttached) {
 		t.Fatal("no attach")
 	}
 	a.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	c.Delta([]byte("\x1b[?1000h\x1b[?1006h"))
 	waitMouseOn(t, a)
 	a.View()
-	r, ok := a.ui.Frame().Rect(paneRect)
+	r, ok := a.ui.Frame().Rect(hc.TerminalID("t7"))
 	if !ok || r.Min.X != sidebarWidth {
 		t.Fatalf("pane rect = %v ok=%v", r, ok)
 	}
@@ -186,7 +187,7 @@ func TestAppMouseRoutingBoundary(t *testing.T) {
 
 func TestAppEventSizeFollowedWhilePassive(t *testing.T) {
 	c, a := newApp(t, `[{"address":"t7","title":"vim","cols":80,"rows":24}]`)
-	if !waitForPhase(t, a.pane, 2*time.Second, pane.StateAttached) {
+	if !waitForPhase(t, a.panes["t7"].p, 2*time.Second, pane.StateAttached) {
 		t.Fatal("no attach")
 	}
 	a.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
@@ -239,8 +240,8 @@ func TestAppResizeWhenWindowSizePrecedesAttach(t *testing.T) {
 
 	a.Update(tea.WindowSizeMsg{Width: 100, Height: 30}) // pane still nil here
 	a.Update(eventMsg{<-sess.Events()})
-	if !waitForPhase(t, a.pane, 2*time.Second, pane.StateAttached) {
-		t.Fatalf("phase = %v", a.pane.Phase())
+	if !waitForPhase(t, a.panes["t7"].p, 2*time.Second, pane.StateAttached) {
+		t.Fatalf("phase = %v", a.panes["t7"].p.Phase())
 	}
 	waitForFrame(t, core, 2*time.Second, func(f testcore.Frame) bool {
 		return f.Kind == 3 && f.Ch == 7 && len(f.Payload) == 4 &&
@@ -254,7 +255,7 @@ func TestAppResizeWhenWindowSizePrecedesAttach(t *testing.T) {
 // WindowSizeMsg the cell stays the 1x1 synthetic one (headless truth).
 func TestAppSendsDisplayFactsAfterAttachConfirmation(t *testing.T) {
 	c, a := newApp(t, `[{"address":"t7","title":"vim","cols":80,"rows":24}]`)
-	if !waitForPhase(t, a.pane, 2*time.Second, pane.StateAttached) {
+	if !waitForPhase(t, a.panes["t7"].p, 2*time.Second, pane.StateAttached) {
 		t.Fatal("no attach")
 	}
 	a.Update(wakeMsg{}) // first live wake: attach confirmation
@@ -281,7 +282,7 @@ func TestAppSendsDisplayFactsAfterAttachConfirmation(t *testing.T) {
 // stores the new truth and queues the Display report in one motion.
 func TestAppSendsFactsWhenCellPxChanges(t *testing.T) {
 	c, a := newApp(t, `[{"address":"t7","title":"vim","cols":80,"rows":24}]`)
-	if !waitForPhase(t, a.pane, 2*time.Second, pane.StateAttached) {
+	if !waitForPhase(t, a.panes["t7"].p, 2*time.Second, pane.StateAttached) {
 		t.Fatal("no attach")
 	}
 	a.setCellPx(9, 18) // what measureCellPx hands over on a real terminal

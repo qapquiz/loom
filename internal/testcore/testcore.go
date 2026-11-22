@@ -48,9 +48,20 @@ type Core struct {
 	Seq           uint64 // baseline seq for the events.subscribe snapshot
 	Terminals     string // JSON array for subscribe snapshot terminals
 
-	mu     sync.Mutex
-	frames []Frame
-	conns  []net.Conn
+	// RunAddresses scripts terminal.run replies, popped in order (the last
+	// entry repeats). RunErrKind fails the call instead. A successful run
+	// also emits the created event a real core sends, so subscribers learn
+	// the record asynchronously from the reply.
+	RunAddresses []string
+	RunErrKind   string
+
+	mu         sync.Mutex
+	frames     []Frame
+	conns      []net.Conn
+	nextStream uint32 // stream channel allocator: first attach gets 7, then 8, 9…
+	runIdx     int
+	runCalls   []RunCall
+	runSeq     uint64 // created-event seqs handed out past Seq
 }
 
 // Serve listens on a Unix socket in a temp dir; tests use Core.SocketPath with
@@ -63,7 +74,7 @@ func Serve(t *testing.T) *Core {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	c := &Core{t: t, syncPath: path}
+	c := &Core{t: t, syncPath: path, nextStream: streamChannel}
 	t.Cleanup(func() { ln.Close() })
 	go func() {
 		for {
@@ -181,7 +192,11 @@ func (c *Core) rpc(conn net.Conn, payload []byte, framed bool) bool {
 			}), framed)
 			return true
 		}
-		c.reply(conn, req.ID, json.RawMessage(`{"channel":`+uitoa(streamChannel)+`,"terminal":{},"resize_notifications":false,"automatic_input":`+boolJSON(c.AutoInput)+`}`), nil, framed)
+		ch := c.allocStream()
+		c.reply(conn, req.ID, json.RawMessage(`{"channel":`+uitoa(uint64(ch))+`,"terminal":{},"resize_notifications":false,"automatic_input":`+boolJSON(c.AutoInput)+`}`), nil, framed)
+		return true
+	case "terminal.run":
+		c.runRPC(conn, req.ID, req.Params, framed)
 		return true
 	default:
 		c.reply(conn, req.ID, json.RawMessage(`{}`), nil, framed)
@@ -205,6 +220,84 @@ func (c *Core) reply(conn net.Conn, id uint64, result, errObj json.RawMessage, f
 	}
 }
 
+// RunCall records one terminal.run the viewer made.
+type RunCall struct {
+	Argv []string
+	Cwd  string
+}
+
+// allocStream hands out the next stream channel; the first attach keeps the
+// historical channel 7, later attaches get their own, like a real core.
+// streamCh reports the latest one, so single-pane helpers (Delta,
+// CloseStream) follow a pane that reattached.
+func (c *Core) allocStream() uint32 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ch := c.nextStream
+	c.nextStream++
+	return ch
+}
+
+func (c *Core) streamCh() uint32 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.nextStream - 1
+}
+
+// runRPC answers terminal.run from the script: an address from RunAddresses
+// (repeating the last when the script runs dry), the scripted error kind, or
+// a refusal when nothing was scripted. A success also emits the created
+// event, after the reply, the way a live core does.
+func (c *Core) runRPC(conn net.Conn, id uint64, params json.RawMessage, framed bool) {
+	var p struct {
+		Argv []string `json:"argv"`
+		Cwd  string   `json:"cwd"`
+	}
+	json.Unmarshal(params, &p)
+	fail := func(kind string) {
+		c.reply(conn, id, nil, mustJSON(map[string]any{
+			"code": -32000, "message": "run failed",
+			"data": map[string]any{"kind": kind},
+		}), framed)
+	}
+	if c.RunErrKind != "" {
+		fail(c.RunErrKind)
+		return
+	}
+	if len(c.RunAddresses) == 0 {
+		fail("unavailable")
+		return
+	}
+	c.mu.Lock()
+	addr := c.RunAddresses[c.runIdx]
+	if c.runIdx < len(c.RunAddresses)-1 {
+		c.runIdx++
+	}
+	c.runCalls = append(c.runCalls, RunCall{Argv: p.Argv, Cwd: p.Cwd})
+	seq := c.Seq + c.runSeq + 1
+	c.runSeq++
+	c.mu.Unlock()
+	rec := map[string]any{
+		"address": addr, "argv": p.Argv, "cwd": p.Cwd, "state": "live",
+		"labels": map[string]string{}, "created_ms": 0, "screen": "exact",
+		"cols": 80, "rows": 24,
+	}
+	c.reply(conn, id, mustJSON(rec), nil, framed)
+	// The record follows asynchronously on the events channel.
+	c.Event("event", map[string]any{
+		"seq": seq, "type": "created", "terminal": addr, "data": rec,
+	})
+}
+
+// Runs snapshots every terminal.run the viewer made, in order.
+func (c *Core) Runs() []RunCall {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]RunCall, len(c.runCalls))
+	copy(out, c.runCalls)
+	return out
+}
+
 // Emit sends one JSON-RPC notification as channel-0 DATA (plain-mode shape;
 // hc tolerates it framed).
 func (c *Core) Emit(method string, params any) {
@@ -220,14 +313,26 @@ func (c *Core) Event(method string, params any) {
 	})})
 }
 
-// Delta sends stream bytes on the attach channel once the viewer attached.
+// Delta sends stream bytes on the current attach channel once the viewer
+// attached (the latest one, for panes that reattached).
 func (c *Core) Delta(b []byte) {
-	c.writeTo0(frame{ch: streamChannel, kind: kindData, payload: b})
+	c.writeTo0(frame{ch: c.streamCh(), kind: kindData, payload: b})
 }
 
-// CloseStream sends CLOSE with a JSON reason on the attach channel.
+// DeltaCh sends stream bytes on a chosen attach channel — the second and
+// later panes, whose attaches got channels past 7.
+func (c *Core) DeltaCh(ch uint32, b []byte) {
+	c.writeTo0(frame{ch: ch, kind: kindData, payload: b})
+}
+
+// CloseStream sends CLOSE with a JSON reason on the current attach channel.
 func (c *Core) CloseStream(reasonJSON string) {
-	c.writeTo0(frame{ch: streamChannel, kind: kindClose, payload: []byte(reasonJSON)})
+	c.writeTo0(frame{ch: c.streamCh(), kind: kindClose, payload: []byte(reasonJSON)})
+}
+
+// CloseStreamCh sends CLOSE with a JSON reason on a chosen attach channel.
+func (c *Core) CloseStreamCh(ch uint32, reasonJSON string) {
+	c.writeTo0(frame{ch: ch, kind: kindClose, payload: []byte(reasonJSON)})
 }
 
 func (c *Core) writeTo0(f frame) {
@@ -336,7 +441,7 @@ func ServeTB(tb testing.TB) *Core {
 	if err != nil {
 		tb.Fatalf("listen: %v", err)
 	}
-	c := &Core{syncPath: path}
+	c := &Core{syncPath: path, nextStream: streamChannel}
 	tb.Cleanup(func() { ln.Close() })
 	go func() {
 		for {

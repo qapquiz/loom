@@ -10,8 +10,9 @@ import (
 // sidebar renders the room for the left rail: one line per terminal with its
 // title and a badge. The badge is the OSC 7501 status word when the program
 // set one, else the room lifecycle state when it is not plain Listed. The
-// attached pane's terminal is marked.
-func sidebar(r *room.Room, active hc.TerminalID) string {
+// focused pane's terminal is marked ▸ and the other open panes ·, so several
+// attachments read at a glance.
+func sidebar(r *room.Room, focused hc.TerminalID, open map[hc.TerminalID]bool) string {
 	ts := r.Terminals()
 	if len(ts) == 0 {
 		return "no terminals"
@@ -19,8 +20,11 @@ func sidebar(r *room.Room, active hc.TerminalID) string {
 	lines := make([]string, 0, len(ts))
 	for _, t := range ts {
 		mark := "  "
-		if t.ID == active {
-			mark = "› " // herdr's own cursor glyph
+		if open[t.ID] {
+			mark = "· " // open in a pane, not the focused one
+		}
+		if t.ID == focused {
+			mark = "▸ " // the pane keys and paste go to
 		}
 		title := t.Info.Title
 		if title == "" {

@@ -2,6 +2,7 @@ package ui
 
 import (
 	"encoding/json"
+	"image"
 	"os"
 
 	tea "charm.land/bubbletea/v2"
@@ -15,45 +16,41 @@ import (
 )
 
 // App is the tea.Model: it pumps hc events and pane wakes onto the tea loop,
-// owns the room and the one attached pane, and renders the sidebar and pane
-// as a bloom tree. Room and App fields are touched only on the tea
-// goroutine; the pane syncs through the session on its own.
+// owns the room, the pane tree and the input mode machine, and renders the
+// sidebar and panes as a bloom tree. Room and App fields are touched only on
+// the tea goroutine; panes sync through the session on their own.
 type App struct {
-	sess   *hc.Session
-	ui     *bloom.Root
-	room   room.Room
-	node   *PaneNode
-	pane   *pane.Pane
-	active hc.TerminalID
+	sess *hc.Session
+	ui   *bloom.Root
+	room room.Room
 
-	wake   chan struct{}
-	width  int
-	height int
+	tree  *layoutNode                 // pane layout; nil until the first attach
+	panes map[hc.TerminalID]*paneSlot // every open slot, by terminal id
+	focus hc.TerminalID               // the pane keys and paste go to
+	mode  inputMode                   // keyboard state machine
+
+	wake          chan struct{}
+	width, height int
 
 	cellW, cellH uint32 // terminal cell px; 1x1 until the kernel reports real geometry
-	sentW, sentH int    // last pane size posted from frame geometry
-	focused      bool   // terminal focus; gates the passive size-follow rule
-	paneLiveSeen bool
+	termFocus    bool   // terminal focus; gates the passive size-follow rule
 }
-
-type paneRectID string
-
-const paneRect paneRectID = "pane"
 
 const sidebarWidth = 20
 
 func New(sess *hc.Session) *App {
 	return &App{
-		sess:    sess,
-		ui:      bloom.New(),
-		wake:    make(chan struct{}, 1),
-		focused: true,
-		cellW:   1,
-		cellH:   1,
+		sess:      sess,
+		ui:        bloom.New(),
+		panes:     map[hc.TerminalID]*paneSlot{},
+		wake:      make(chan struct{}, 1),
+		termFocus: true,
+		cellW:     1,
+		cellH:     1,
 	}
 }
 
-// notify is the pane's wake hook, called on the session goroutine; the
+// notify is a pane's wake hook, called on the session goroutine; the
 // buffered channel coalesces a burst of publishes into one redraw.
 func (a *App) notify() {
 	select {
@@ -92,6 +89,12 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case wakeMsg:
 		a.onWake()
 		cmds = append(cmds, a.waitWake())
+	case runMsg:
+		// A failed run leaves the layout single-pane; the room's events are
+		// the surface for what happened (the core reports the spawn).
+		if msg.err == nil {
+			a.addPane(msg.id, msg.vert)
+		}
 	case sessionClosedMsg:
 		return a, tea.Quit
 	case tea.WindowSizeMsg:
@@ -99,83 +102,163 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.setCellPx(measureCellPx(msg.Width, msg.Height))
 		a.postSize(msg.Width, msg.Height)
 	case tea.KeyPressMsg:
-		if msg.Code == 'q' && msg.Mod&tea.ModCtrl != 0 {
-			return a, tea.Quit
-		}
-		if (msg.Code == tea.KeyPgUp || msg.Code == tea.KeyPgDown) && a.scrollPage(msg.Code) {
-			break // scrollback owns the key; the pane never sees it
-		}
-		if a.pane != nil {
-			a.pane.Enqueue(pane.Op{Kind: pane.OpKey, Key: toPaneKey(tea.Key(msg))})
+		if cmd := a.key(msg); cmd != nil {
+			cmds = append(cmds, cmd)
 		}
 	case tea.PasteMsg:
-		if a.pane != nil {
-			a.pane.Enqueue(pane.Op{Kind: pane.OpKey, Key: pane.Key{Text: msg.Content}})
-		}
+		a.sendKey(pane.Key{Text: msg.Content})
 	case tea.MouseClickMsg, tea.MouseReleaseMsg, tea.MouseMotionMsg, tea.MouseWheelMsg:
 		a.routeMouse(msg.(tea.MouseMsg))
 	case tea.FocusMsg:
-		a.focused = true
-		if a.pane != nil {
-			a.pane.Enqueue(pane.Op{Kind: pane.OpActive, Active: true})
-		}
+		a.termFocus = true
+		a.activeOp(pane.Op{Kind: pane.OpActive, Active: true})
 	case tea.BlurMsg:
-		a.focused = false
-		if a.pane != nil {
-			a.pane.Enqueue(pane.Op{Kind: pane.OpActive, Active: false})
-		}
+		a.termFocus = false
+		a.activeOp(pane.Op{Kind: pane.OpActive, Active: false})
 	}
 	return a, tea.Batch(cmds...)
 }
 
+// key runs the input mode machine over one keypress and returns the command
+// it spawned (nil for everything routed straight to a pane). ctrl+q quits
+// from any mode. In prefix mode the key is swallowed either way: bound →
+// command, unbound → dropped, second ctrl+b → a literal 0x02 forwarded to
+// the focused pane (tmux semantics). ctrl+b enters prefix only from
+// passthrough — the chooser owns its keys and ignores the prefix machinery.
+func (a *App) key(msg tea.KeyPressMsg) tea.Cmd {
+	if msg.Code == 'q' && msg.Mod&tea.ModCtrl != 0 {
+		a.mode = modePassthrough
+		return tea.Quit
+	}
+	if a.mode == modePrefix {
+		a.mode = modePassthrough
+		if msg.Code == 'b' && msg.Mod&tea.ModCtrl != 0 {
+			a.sendKey(pane.Key{Text: "\x02"})
+		} else if r, ok := bindRune(msg); ok {
+			if cmd, bound := bindings[r]; bound {
+				return a.runCommand(cmd)
+			}
+		}
+		return nil
+	}
+	if a.mode == modePassthrough && msg.Code == 'b' && msg.Mod&tea.ModCtrl != 0 {
+		a.mode = modePrefix
+		return nil
+	}
+	if (msg.Code == tea.KeyPgUp || msg.Code == tea.KeyPgDown) && a.scrollPage(msg.Code) {
+		return nil // scrollback owns the key; the pane never sees it
+	}
+	a.sendKey(toPaneKey(tea.Key(msg)))
+	return nil
+}
+
+// runCommand executes one bound command. Splits spawn a shell in a new
+// terminal and graft it beside the focused pane once Run answers; the
+// chooser is wave 2's mode and inert here.
+func (a *App) runCommand(cmd command) tea.Cmd {
+	switch cmd {
+	case cmdSplitVertical:
+		return a.split(true)
+	case cmdSplitHorizontal:
+		return a.split(false)
+	case cmdChooseWindow:
+		// wave 2: modeChooser and the window list over the room
+	}
+	return nil
+}
+
+// split asks the core for a fresh shell terminal (bg, cwd $HOME); runMsg
+// grafts it in. Run blocks on the RPC reply, so it runs inside the command,
+// never on the tea goroutine.
+func (a *App) split(vert bool) tea.Cmd {
+	sess, cwd := a.sess, homeDir()
+	return func() tea.Msg {
+		id, err := sess.Run(nil, cwd)
+		return runMsg{id: id, vert: vert, err: err}
+	}
+}
+
+func homeDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return "."
+	}
+	return home
+}
+
+// sendKey routes one key op to the focused pane only.
+func (a *App) sendKey(k pane.Key) {
+	if s := a.panes[a.focus]; s != nil {
+		s.p.Enqueue(pane.Op{Kind: pane.OpKey, Key: k})
+	}
+}
+
+// activeOp addresses the focused pane with a viewer-activity op: loom's
+// window focus is the focused pane's activity; the others stay passive.
+func (a *App) activeOp(op pane.Op) {
+	if s := a.panes[a.focus]; s != nil {
+		s.p.Enqueue(op)
+	}
+}
+
+// setFocus moves pane focus: the old pane drops to a passive viewer
+// (FOCUS 0 on the wire), the new one takes viewer activity (OpActive
+// records intent while its attach is still in flight; the first live wake
+// pays the FOCUS debt).
+func (a *App) setFocus(id hc.TerminalID) {
+	if a.focus == id {
+		return
+	}
+	if old := a.panes[a.focus]; old != nil {
+		old.p.Enqueue(pane.Op{Kind: pane.OpActive, Active: false})
+	}
+	a.focus = id
+	if s := a.panes[id]; s != nil {
+		s.p.Enqueue(pane.Op{Kind: pane.OpActive, Active: true})
+	}
+}
+
 func (a *App) onEvent(ev hc.Event) {
-	if a.room.Apply(ev) && a.pane == nil {
+	if a.room.Apply(ev) && a.tree == nil {
 		a.attachFirst()
 	}
-	if ev.ID != a.active {
+	s := a.panes[ev.ID]
+	if s == nil {
 		return
 	}
 	switch ev.Kind {
 	case hc.EventLost:
-		a.paneChange(pane.ChangeLost)
+		s.p.Change(pane.ChangeLost)
 	case hc.EventRestarted:
-		a.paneChange(pane.ChangeRestarted)
+		s.p.Change(pane.ChangeRestarted)
 	case hc.EventFinished:
-		a.paneChange(pane.ChangeFinished)
+		s.p.Change(pane.ChangeFinished)
 	case hc.EventRemoved:
-		a.paneChange(pane.ChangeRemoved)
+		s.p.Change(pane.ChangeRemoved)
 	case hc.EventCreated:
-		a.paneChange(pane.ChangeCreated)
+		s.p.Change(pane.ChangeCreated)
 	case hc.EventSize:
-		// Passive viewers follow the core's size; while active our sent
-		// resize is authoritative in flight (the last-active rule).
-		if a.pane != nil && !a.focused {
-			a.pane.Enqueue(pane.Op{Kind: pane.OpResize, Cols: ev.Info.Cols, Rows: ev.Info.Rows})
+		// Passive viewers follow the core's size: every pane but the
+		// focused one, and every pane while loom's window is blurred. The
+		// focused pane's in-flight resize stays authoritative (the
+		// last-active rule).
+		if !a.termFocus || ev.ID != a.focus {
+			s.p.Enqueue(pane.Op{Kind: pane.OpResize, Cols: ev.Info.Cols, Rows: ev.Info.Rows})
 		}
 	}
 }
 
+// attachFirst auto-attaches the one initial pane once the room knows a
+// candidate; later panes only ever come from splits.
 func (a *App) attachFirst() {
+	if a.tree != nil {
+		return
+	}
 	id := pickAttach(&a.room, os.Getenv("LOOM_ATTACH"))
 	if id == "" {
 		return
 	}
-	p := pane.New(string(id), a.notify)
-	p.SetPump(a.sess.Do)
-	p.SetAttachFn(func() { a.sess.Attach(id, hcStream{p: p}) })
-	a.pane = p
-	a.node = NewPaneNode(p)
-	a.active = id
-	a.sentW, a.sentH = 0, 0
-	a.paneLiveSeen = false
-	p.Change(pane.ChangeAttach)
-	// The initial WindowSizeMsg usually predates the snapshot, so re-post
-	// the stored size here: OpResize records want while not live, and
-	// Connected's reconcile imposes it (the pane's own idempotence keeps
-	// this an echo, not a fight). Cell px rides the same re-post: the store
-	// was dropped before SetPump existed.
-	a.pushCellPx()
-	a.postSize(a.width, a.height)
+	a.addPane(id, false)
 }
 
 // pickAttach chooses the auto-attach target: LOOM_ATTACH by terminal id or
@@ -200,23 +283,48 @@ func pickAttach(r *room.Room, want string) hc.TerminalID {
 	return ""
 }
 
-func (a *App) paneChange(ch pane.Change) {
-	if a.pane != nil {
-		a.pane.Change(ch)
+// addPane grafts a terminal into the tree — the first pane becomes the
+// whole tree, later ones split the focused leaf — and focuses it. The
+// room's created event follows on its own; the attach goes straight to the
+// id Run returned (or pickAttach chose), never through the room.
+func (a *App) addPane(id hc.TerminalID, vert bool) {
+	if id == "" {
+		return
 	}
+	if _, dup := a.panes[id]; dup {
+		return
+	}
+	p := pane.New(string(id), a.notify)
+	p.SetPump(a.sess.Do)
+	p.SetAttachFn(func() { a.sess.Attach(id, hcStream{p: p}) })
+	s := &paneSlot{id: id, p: p, node: NewPaneNode(p)}
+	a.panes[id] = s
+	if a.tree == nil {
+		a.tree = &layoutNode{leaf: s}
+	} else {
+		a.tree.split(a.focus, &layoutNode{leaf: s}, vert)
+	}
+	a.setFocus(id)
+	p.Change(pane.ChangeAttach)
+	// The attach's standing debts, the same ones the first pane pays: the
+	// cell px the pane was born without, and the size that predates the
+	// attach — recorded while not live, imposed by Connected's reconcile
+	// (the pane's own idempotence makes the re-post an echo, not a fight).
+	p.SetCellPx(a.cellW, a.cellH)
+	a.postSize(a.width, a.height)
 }
 
-// onWake reasserts focus on the first live frame: OpActive(true) queued
-// before the attach was confirmed recorded intent only, so the FOCUS frame
-// and forced reconcile still owe the stream after Connected.
+// onWake pays each pane's attach-confirmation debts on its first live
+// frame: viewer activity (the focused pane active, the others passive) and
+// the Display facts queued while not live, which the pane's phase gate
+// dropped — the same debt the single-pane app paid on its one first wake.
 func (a *App) onWake() {
-	if a.pane != nil && !a.paneLiveSeen && a.pane.Phase() == pane.StateAttached {
-		a.paneLiveSeen = true
-		a.pane.Enqueue(pane.Op{Kind: pane.OpActive, Active: true})
-		// Attach confirmed: the Display facts queued while not live were
-		// dropped by the pane's phase gate, so the report is owed now — the
-		// same debt FOCUS pays on this first live wake.
-		a.sendFacts()
+	for _, s := range a.panes {
+		if !s.liveSeen && s.p.Phase() == pane.StateAttached {
+			s.liveSeen = true
+			s.p.Enqueue(pane.Op{Kind: pane.OpActive, Active: s.id == a.focus})
+			a.sendFacts(s)
+		}
 	}
 }
 
@@ -241,9 +349,9 @@ func measureCellPx(cols, rows int) (uint32, uint32) {
 	return w, h
 }
 
-// setCellPx threads pixel truth into the pane and reports it as Display
+// setCellPx threads pixel truth into every pane and reports it as Display
 // facts whenever it changed; the stored value survives pane swaps (it is
-// the terminal's truth, not the pane's).
+// the terminal's truth, not any pane's).
 func (a *App) setCellPx(w, h uint32) {
 	if w == 0 || h == 0 {
 		w, h = 1, 1
@@ -252,13 +360,9 @@ func (a *App) setCellPx(w, h uint32) {
 		return
 	}
 	a.cellW, a.cellH = w, h
-	a.pushCellPx()
-	a.sendFacts()
-}
-
-func (a *App) pushCellPx() {
-	if a.pane != nil {
-		a.pane.SetCellPx(a.cellW, a.cellH)
+	for _, s := range a.panes {
+		s.p.SetCellPx(w, h)
+		a.sendFacts(s)
 	}
 }
 
@@ -269,83 +373,91 @@ type displayFacts struct {
 	Cell []uint32 `json:"cell"`
 }
 
-// sendFacts queues the Display report for the wire. The pane is the
-// phase-gated writer: while not live the op is dropped, and the pending
+// sendFacts queues the Display report for one pane's stream. The pane is
+// the phase-gated writer: while not live the op is dropped, and the pending
 // truth rides the attach-confirmation send instead (onWake).
-func (a *App) sendFacts() {
-	if a.pane == nil {
+func (a *App) sendFacts(s *paneSlot) {
+	if s == nil {
 		return
 	}
 	raw, err := json.Marshal(displayFacts{Cell: []uint32{a.cellW, a.cellH}})
 	if err != nil {
 		return
 	}
-	a.pane.Enqueue(pane.Op{Kind: pane.OpFacts, Facts: string(raw)})
+	s.p.Enqueue(pane.Op{Kind: pane.OpFacts, Facts: string(raw)})
 }
 
-// postSize solves the tree at w×h and posts a RESIZE when the pane rect
-// drifted. Solve mirrors View's layout, so this works before any frame
-// exists on screen.
+// postSize solves the tree at w×h and posts each pane's RESIZE when its own
+// rect drifted: every pane is its own viewer of its own terminal, keyed by
+// the pane id as the bloom rect id. Solve mirrors View's layout, so this
+// works before any frame exists on screen.
 func (a *App) postSize(w, h int) {
-	if w <= 0 || h <= 0 || a.pane == nil {
+	if w <= 0 || h <= 0 || a.tree == nil {
 		return
 	}
-	if r, ok := bloom.Solve(w, h, a.layout()).Rect(paneRect); ok {
-		if r.Dx() != a.sentW || r.Dy() != a.sentH {
-			a.sentW, a.sentH = r.Dx(), r.Dy()
-			a.pane.Enqueue(pane.Op{Kind: pane.OpResize, Cols: uint16(r.Dx()), Rows: uint16(r.Dy())})
+	f := bloom.Solve(w, h, a.layout())
+	for _, s := range a.panes {
+		r, ok := f.Rect(s.id)
+		if !ok || (r.Dx() == s.sentW && r.Dy() == s.sentH) {
+			continue
 		}
+		s.sentW, s.sentH = r.Dx(), r.Dy()
+		s.p.Enqueue(pane.Op{Kind: pane.OpResize, Cols: uint16(r.Dx()), Rows: uint16(r.Dy())})
 	}
 }
 
-// routeMouse lets wheel events over the pane drive loom's scrollback while
-// the program inside does not own the mouse; everything else — and every
-// mouse event while the program owns it — forwards as before.
+// routeMouse hit-tests the pane rects first: a click focuses the pane it
+// landed in before any forwarding decision, and wheel scrolling and MouseOn
+// forwarding apply to that hit pane, not the focused one. The solve mirrors
+// View's layout, so routing works before a frame exists on screen.
 func (a *App) routeMouse(msg tea.MouseMsg) {
-	if w, ok := msg.(tea.MouseWheelMsg); ok && a.scrollWheel(w) {
+	hit := a.hitPane(msg.Mouse())
+	if _, ok := msg.(tea.MouseClickMsg); ok && hit != nil {
+		a.setFocus(hit.id)
+	}
+	if w, ok := msg.(tea.MouseWheelMsg); ok && a.scrollWheel(hit, w) {
 		return
 	}
-	a.forwardMouse(msg)
+	a.forwardMouse(hit, msg)
 }
 
 // wheelLines is the scroll step per wheel event, the three-line xterm
 // convention.
 const wheelLines = 3
 
-// scrollWheel turns one wheel event over the pane rect into a scrollback op
-// when the program does not own the mouse. Reports whether it consumed the
-// event.
-func (a *App) scrollWheel(w tea.MouseWheelMsg) bool {
-	if a.pane == nil {
+// scrollWheel turns one wheel event over the hit pane's rect into that
+// pane's scrollback op when its program does not own the mouse. Reports
+// whether it consumed the event.
+func (a *App) scrollWheel(s *paneSlot, w tea.MouseWheelMsg) bool {
+	if s == nil {
 		return false
 	}
-	if s := a.pane.Screen(); s == nil || s.MouseOn {
-		return false
-	}
-	if !a.mouseOverPane(w.Mouse()) {
+	scr := s.p.Screen()
+	if scr == nil || scr.MouseOn {
 		return false
 	}
 	n := -wheelLines
 	if w.Button == tea.MouseWheelDown {
 		n = wheelLines
 	}
-	a.pane.Enqueue(pane.Op{Kind: pane.OpScrollDelta, N: n})
+	s.p.Enqueue(pane.Op{Kind: pane.OpScrollDelta, N: n})
 	return true
 }
 
-// scrollPage pages the pane's scrollback on PageUp/PageDown while the
-// program does not own the mouse; with it owned the page keys stay program
-// keys, exactly as before. The page is the pane's own Rows. Reports whether
-// it consumed the key.
+// scrollPage pages the focused pane's scrollback on PageUp/PageDown while
+// its program does not own the mouse; with it owned the page keys stay
+// program keys, exactly as before. The page is the pane's own Rows.
+// Reports whether it consumed the key.
 func (a *App) scrollPage(code rune) bool {
-	if a.pane == nil {
+	s := a.panes[a.focus]
+	if s == nil {
 		return false
 	}
-	s := a.pane.Screen()
-	if s == nil || s.MouseOn {
+	scr := s.p.Screen()
+	if scr == nil || scr.MouseOn {
 		return false
 	}
-	page := s.Rows
+	page := scr.Rows
 	if page < 1 {
 		page = 1
 	}
@@ -353,59 +465,86 @@ func (a *App) scrollPage(code rune) bool {
 	if code == tea.KeyPgDown {
 		n = page
 	}
-	a.pane.Enqueue(pane.Op{Kind: pane.OpScrollDelta, N: n})
+	s.p.Enqueue(pane.Op{Kind: pane.OpScrollDelta, N: n})
 	return true
 }
 
-// forwardMouse maps a screen event to pane-relative cells and forwards it
-// only while the program inside owns the mouse; otherwise the event belongs
-// to the terminal's own selection and the pane stands down.
-func (a *App) forwardMouse(msg tea.MouseMsg) {
-	if a.pane == nil {
+// forwardMouse maps a screen event to pane-relative cells and forwards it to
+// the hit pane only while the program inside owns the mouse; otherwise the
+// event belongs to the terminal's own selection and the pane stands down.
+func (a *App) forwardMouse(s *paneSlot, msg tea.MouseMsg) {
+	if s == nil {
 		return
 	}
-	s := a.pane.Screen()
-	if s == nil || !s.MouseOn {
+	scr := s.p.Screen()
+	if scr == nil || !scr.MouseOn {
 		return
 	}
-	if !a.mouseOverPane(msg.Mouse()) {
-		return
-	}
-	r, ok := a.ui.Frame().Rect(paneRect)
+	r, ok := a.paneRect(s.id)
 	if !ok {
 		return
 	}
 	m := msg.Mouse()
-	a.pane.Enqueue(mouseToOp(msg, m.X-r.Min.X, m.Y-r.Min.Y))
+	s.p.Enqueue(mouseToOp(msg, m.X-r.Min.X, m.Y-r.Min.Y))
 }
 
-// mouseOverPane reports whether a screen point sits inside the pane rect.
-func (a *App) mouseOverPane(m tea.Mouse) bool {
-	r, ok := a.ui.Frame().Rect(paneRect)
-	if !ok {
-		return false
+// paneRect solves the current layout for one pane's rect — the same solve
+// postSize and the hit-test use.
+func (a *App) paneRect(id hc.TerminalID) (image.Rectangle, bool) {
+	if a.tree == nil || a.width <= 0 || a.height <= 0 {
+		return image.Rectangle{}, false
 	}
-	return m.X >= r.Min.X && m.X < r.Max.X && m.Y >= r.Min.Y && m.Y < r.Max.Y
+	return bloom.Solve(a.width, a.height, a.layout()).Rect(id)
+}
+
+// hitPane finds the pane whose solved rect contains the screen point, in
+// layout order (a before b), or nil when the point is over none.
+func (a *App) hitPane(m tea.Mouse) *paneSlot {
+	if a.tree == nil || a.width <= 0 || a.height <= 0 {
+		return nil
+	}
+	f := bloom.Solve(a.width, a.height, a.layout())
+	var hit *paneSlot
+	a.tree.leaves(func(s *paneSlot) {
+		if hit != nil {
+			return
+		}
+		if r, ok := f.Rect(s.id); ok && m.X >= r.Min.X && m.X < r.Max.X && m.Y >= r.Min.Y && m.Y < r.Max.Y {
+			hit = s
+		}
+	})
+	return hit
 }
 
 func (a *App) layout() bloom.Child {
 	body := bloom.Child(bloom.Text("attaching…"))
-	if a.node != nil {
-		body = a.node
+	if a.tree != nil {
+		body = a.tree.child()
 	}
 	return bloom.Column(
 		bloom.Fill(
 			bloom.Row(
-				bloom.Fixed(sidebarWidth, bloom.Text(sidebar(&a.room, a.active))),
-				bloom.Fill(body).ID(paneRect),
+				bloom.Fixed(sidebarWidth, bloom.Text(sidebar(&a.room, a.focus, a.openPanes()))),
+				bloom.Fill(body),
 			),
 		),
 	)
 }
 
-// View forces MouseModeAllMotion while the inner program owns the mouse:
-// forwarding needs motion reporting, and MouseModeNone otherwise leaves the
-// terminal's own selection working (bloom computes the least mode itself).
+// openPanes is the sidebar's attachment view: which room records have a
+// pane in loom's tree right now.
+func (a *App) openPanes() map[hc.TerminalID]bool {
+	open := make(map[hc.TerminalID]bool, len(a.panes))
+	for id := range a.panes {
+		open[id] = true
+	}
+	return open
+}
+
+// View forces MouseModeAllMotion while the focused pane's program owns the
+// mouse: forwarding needs motion reporting, and MouseModeNone otherwise
+// leaves the terminal's own selection working (bloom computes the least
+// mode itself).
 func (a *App) View() tea.View {
 	v := a.ui.View(a.width, a.height, a.layout())
 	v.AltScreen = true
@@ -416,13 +555,20 @@ func (a *App) View() tea.View {
 	return v
 }
 
+// paneScreen is the focused pane's screen — the one whose mouse ownership
+// decides loom's own mouse reporting.
 func (a *App) paneScreen() *pane.Screen {
-	if a.pane == nil {
-		return nil
+	if s := a.panes[a.focus]; s != nil {
+		return s.p.Screen()
 	}
-	return a.pane.Screen()
+	return nil
 }
 
 type eventMsg struct{ ev hc.Event }
 type wakeMsg struct{}
 type sessionClosedMsg struct{}
+type runMsg struct {
+	id   hc.TerminalID // the address terminal.run returned; "" never reaches here
+	vert bool          // graft orientation for the new slot
+	err  error
+}

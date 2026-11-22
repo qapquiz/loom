@@ -42,8 +42,8 @@ func waitForScreen(t *testing.T, a *App, d time.Duration, fn func(s *pane.Screen
 func attachedApp(t *testing.T) (*testcore.Core, *App) {
 	t.Helper()
 	c, a := newApp(t, `[{"address":"t7","title":"vim","cols":80,"rows":24}]`)
-	if !waitForPhase(t, a.pane, 2*time.Second, pane.StateAttached) {
-		t.Fatalf("no attach; phase = %v", a.pane.Phase())
+	if !waitForPhase(t, a.panes["t7"].p, 2*time.Second, pane.StateAttached) {
+		t.Fatalf("no attach; phase = %v", a.panes["t7"].p.Phase())
 	}
 	// 100 wide minus the sidebar leaves the pane 80x30; a frame must exist
 	// for the pane rect the wheel routing tests against.

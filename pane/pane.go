@@ -8,8 +8,6 @@ import (
 	"sync/atomic"
 
 	"go.mitchellh.com/libghostty"
-
-	"loom/hc"
 )
 
 type Cell struct {
@@ -91,18 +89,19 @@ type Op struct {
 	N      int    // OpScrollDelta: lines to scroll, negative up
 }
 
-// Pane implements hc.Stream. All emulator mutation happens on hc's read-loop
-// goroutine: Stream callbacks arrive there, and Enqueue/Change run their work
-// through Session.Do (the enqueue-only UI→session path), so exactly one
-// goroutine owns the state at any moment. Screen is the only lock-free read.
+// Pane implements Stream. All emulator mutation happens on the session
+// read-loop goroutine: Stream callbacks arrive there, and Enqueue/Change run
+// their work through the pump (the enqueue-only UI→session path), so exactly
+// one goroutine owns the state at any moment. Screen is the only lock-free
+// read.
 type Pane struct {
-	id   hc.TerminalID
+	id   string
 	wake func()
 
-	pump    func(func()) // hc.Session.Do; set by SetPump before first use
+	pump    func(func()) // the session runner; set by SetPump before first use
 	screen  atomic.Pointer[Screen]
 	state   atomic.Uint32 // machine state; written only on the session goroutine, read from any
-	out     hc.StreamOut
+	out     StreamOut
 	active  bool
 	wantCol uint16
 	wantRow uint16
@@ -112,10 +111,10 @@ type Pane struct {
 	cellH   uint32
 
 	emu      *emulator
-	attachFn func() // wave-2 seam: the app sets sess.Attach(id, p)
+	attachFn func() // wave-2 seam: the app wires the transport's attach
 }
 
-func New(id hc.TerminalID, wake func()) *Pane {
+func New(id string, wake func()) *Pane {
 	p := &Pane{
 		id:      id,
 		wake:    wake,
@@ -131,7 +130,7 @@ func New(id hc.TerminalID, wake func()) *Pane {
 	return p
 }
 
-func (p *Pane) ID() hc.TerminalID { return p.id }
+func (p *Pane) ID() string { return p.id }
 
 // Phase reports the machine state; writes are gated on it (graft 4), never on
 // a parallel flag.
@@ -143,11 +142,11 @@ func (p *Pane) Screen() *Screen { return p.screen.Load() }
 // Enqueue queues an op; non-blocking, dropped when the session queue is full.
 func (p *Pane) Enqueue(op Op) { p.enqueue(op) }
 
-// Change feeds an hc-derived lifecycle change (lost/restarted/finished/...).
-// The app routes hc events here; the machine is the only place they land.
+// Change feeds a transport lifecycle change (lost/restarted/finished/...).
+// The app routes transport events here; the machine is the only place they land.
 func (p *Pane) Change(ch Change) { p.enqueue(ch) }
 
-// SetPump wires the session-goroutine runner (hc.Session.Do). Must be called
+// SetPump wires the session-goroutine runner (the session's Do). Must be called
 // before the first Enqueue/Change; before that they are dropped.
 func (p *Pane) SetPump(fn func(func())) { p.pump = fn }
 
@@ -184,9 +183,9 @@ func (p *Pane) enqueue(v any) {
 	})
 }
 
-// --- hc.Stream — called on the session goroutine ---
+// --- Stream — called on the session goroutine ---
 
-func (p *Pane) Connected(out hc.StreamOut, autoInput bool) {
+func (p *Pane) Connected(out StreamOut, autoInput bool) {
 	p.out = out
 	p.applyChange(ChangeAttachOK)
 	p.reconcile(false) // impose want if it drifted from the attach size
@@ -200,7 +199,7 @@ func (p *Pane) Delta(b []byte) {
 	p.publish(false)
 }
 
-func (p *Pane) Closed(r hc.CloseReason) {
+func (p *Pane) Closed(r CloseReason) {
 	p.out = nil
 	switch r.Reason {
 	case "exited":

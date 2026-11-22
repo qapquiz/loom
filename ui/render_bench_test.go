@@ -114,6 +114,6 @@ func wirePaneB(b *testing.B) (*testcore.Core, *hc.Session, *pane.Pane) {
 	b.Cleanup(func() { sess.Close() })
 	p := pane.New("t7", nil)
 	p.SetPump(sess.Do)
-	p.SetAttachFn(func() { sess.Attach("t7", p) })
+	p.SetAttachFn(func() { sess.Attach("t7", hcStream{p: p}) })
 	return core, sess, p
 }

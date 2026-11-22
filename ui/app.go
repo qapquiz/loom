@@ -160,9 +160,9 @@ func (a *App) attachFirst() {
 	if id == "" {
 		return
 	}
-	p := pane.New(id, a.notify)
+	p := pane.New(string(id), a.notify)
 	p.SetPump(a.sess.Do)
-	p.SetAttachFn(func() { a.sess.Attach(id, p) })
+	p.SetAttachFn(func() { a.sess.Attach(id, hcStream{p: p}) })
 	a.pane = p
 	a.node = NewPaneNode(p)
 	a.active = id

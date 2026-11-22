@@ -19,6 +19,19 @@ import (
 
 const firstPaint = "hello \x1b[1;32mloom\x1b[0m"
 
+// hcStream adapts *Pane to hc.Stream for this test file: the pane owns its
+// contract now, so the shim lives where hc is still imported (ui owns the
+// production one).
+type hcStream struct{ p *Pane }
+
+func (s hcStream) Connected(out hc.StreamOut, autoInput bool) {
+	s.p.Connected(out, autoInput)
+}
+
+func (s hcStream) Delta(b []byte) { s.p.Delta(b) }
+
+func (s hcStream) Closed(r hc.CloseReason) { s.p.Closed(CloseReason(r)) }
+
 func wirePane(t *testing.T, core *testcore.Core, autoInput bool) (*hc.Session, *Pane) {
 	t.Helper()
 	core.AutoInput = autoInput
@@ -29,7 +42,7 @@ func wirePane(t *testing.T, core *testcore.Core, autoInput bool) (*hc.Session, *
 	t.Cleanup(func() { sess.Close() })
 	p := New("t7", nil)
 	p.SetPump(sess.Do)
-	p.SetAttachFn(func() { sess.Attach("t7", p) })
+	p.SetAttachFn(func() { sess.Attach("t7", hcStream{p}) })
 	return sess, p
 }
 
@@ -185,7 +198,7 @@ func TestWritesDroppedBeforeNegotiation(t *testing.T) {
 	core.AutoInput = false
 	p := New("t7", nil)
 	p.SetPump(sess.Do)
-	p.SetAttachFn(func() { sess.Attach("t7", p) })
+	p.SetAttachFn(func() { sess.Attach("t7", hcStream{p}) })
 	attach(t, p)
 	core.Delta([]byte("\x1b[c"))
 	time.Sleep(200 * time.Millisecond)
@@ -206,7 +219,7 @@ func TestPhaseGatedWritesBeforeLive(t *testing.T) {
 	// Pane wired but never attached: idle. Writes are refused (graft 4)...
 	p := New("t7", nil)
 	p.SetPump(sess.Do)
-	p.SetAttachFn(func() { sess.Attach("t7", p) })
+	p.SetAttachFn(func() { sess.Attach("t7", hcStream{p}) })
 	p.Enqueue(Op{Kind: OpKey, Key: Key{Text: "x"}})
 	p.Enqueue(Op{Kind: OpActive, Active: true})
 	time.Sleep(150 * time.Millisecond) // let the queue drain onto the session goroutine

@@ -274,6 +274,18 @@ func TestLiveAttachFirstPaintAndAutoInput(t *testing.T) {
 	})
 }
 
+// paneShim adapts *pane.Pane to hc.Stream for this file: the pane owns its
+// stream contract now, and ui owns the production adapter.
+type paneShim struct{ p *pane.Pane }
+
+func (s paneShim) Connected(out hc.StreamOut, autoInput bool) {
+	s.p.Connected(out, autoInput)
+}
+
+func (s paneShim) Delta(b []byte) { s.p.Delta(b) }
+
+func (s paneShim) Closed(r hc.CloseReason) { s.p.Closed(pane.CloseReason(r)) }
+
 func TestLivePaneEndToEndTypedEcho(t *testing.T) {
 	requireLive(t)
 	id, name := scratchTerm(t)
@@ -282,9 +294,9 @@ func TestLivePaneEndToEndTypedEcho(t *testing.T) {
 	drainEvents(sess)
 	// The app wiring, verbatim: pump the ops through the session, attach via
 	// the machine's effect.
-	p := pane.New(id, nil)
+	p := pane.New(string(id), nil)
 	p.SetPump(sess.Do)
-	p.SetAttachFn(func() { sess.Attach(id, p) })
+	p.SetAttachFn(func() { sess.Attach(id, paneShim{p}) })
 	p.Change(pane.ChangeAttach) // idle -> attaching, runs the attach effect
 	waitUntil(t, 5*time.Second, "pane to attach", func() bool { return p.Phase() == pane.StateAttached })
 

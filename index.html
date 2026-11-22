@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>loom — a terminal client for herdr-core</title>
+<style>
+  :root {
+    --bg: #0d0a12;
+    --panel: #161020;
+    --ink: #e8e2d8;
+    --dim: #9a8fa8;
+    --rose: #ff6f91;
+    --apricot: #ffc29b;
+    --green: #7fd18b;
+    --rule: #2a2138;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: "JetBrains Mono", "Adwaita Mono", ui-monospace, monospace;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 64px 28px 96px; }
+  header { margin-bottom: 56px; }
+  .wordmark { display: flex; align-items: baseline; gap: 18px; flex-wrap: wrap; }
+  h1 { font-size: 44px; margin: 0; letter-spacing: -1px; font-weight: 700; }
+  h1 .dot { color: var(--rose); }
+  .tag { color: var(--dim); font-size: 15px; }
+  .lede { font-size: 17px; max-width: 68ch; margin-top: 18px; color: var(--ink); }
+  .lede b { color: var(--apricot); font-weight: 600; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 2.5px; color: var(--dim); margin: 56px 0 18px; font-weight: 600; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }
+  .card { background: var(--panel); border: 1px solid var(--rule); border-radius: 10px; padding: 18px 20px; }
+  .card h3 { margin: 0 0 6px; font-size: 15px; color: var(--apricot); }
+  .card p { margin: 0; font-size: 13.5px; color: var(--dim); }
+  .card .dep { display: block; margin-top: 10px; font-size: 12px; color: var(--green); }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--rule); }
+  th { color: var(--dim); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; }
+  td.num { color: var(--green); white-space: nowrap; }
+  td.was { color: var(--dim); text-decoration: line-through; text-decoration-color: #5a4a3a; white-space: nowrap; }
+  ul.feats { list-style: none; padding: 0; margin: 0; font-size: 14.5px; }
+  ul.feats li { padding: 7px 0; border-bottom: 1px solid var(--rule); display: flex; gap: 12px; }
+  ul.feats li:last-child { border-bottom: 0; }
+  ul.feats .k { color: var(--rose); flex: 0 0 auto; }
+  .demo { background: var(--panel); border: 1px solid var(--rule); border-radius: 10px; padding: 10px; }
+  .demo img { display: block; width: 100%; height: auto; border-radius: 6px; }
+  .caption { font-size: 12.5px; color: var(--dim); padding: 12px 6px 2px; }
+  .caption span { color: var(--apricot); }
+  footer { margin-top: 64px; padding-top: 20px; border-top: 1px solid var(--rule); font-size: 12.5px; color: var(--dim); display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+  footer a { color: var(--dim); text-decoration: none; border-bottom: 1px dotted var(--dim); }
+  footer a:hover { color: var(--ink); }
+  code { color: var(--green); font-size: 0.92em; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div class="wordmark">
+    <h1>loom<span class="dot">.</span></h1>
+    <span class="tag">a terminal client for herdr-core, built on bloom</span>
+  </div>
+  <p class="lede">
+    Close the window and your agents keep working. loom attaches to a local
+    <b>herdr-core</b> (<code>hc</code>) server, renders its terminals as panes in a
+    <b>bloom</b> TUI, forwards keys and mouse, resizes with the layout, and comes back
+    to the same screen when you reattach. The core owns the processes; loom owns the pixels.
+  </p>
+</header>
+
+<h2>The demo</h2>
+<div class="demo">
+  <img src="docs/demo.gif" alt="loom demo: attach, typing through the pane, live tail under a 120-line flood, scrollback with indicator, detach, reattach to the same screen">
+  <p class="caption">
+    <span>01–08</span>&nbsp; attach &middot; typing through loom into the shell &middot; live tail &middot;
+    scrollback (<span>&uarr; indicator</span>) &middot; return to live &middot; loom killed, program survives &middot;
+    reattach shows the same screen. Frames captured from a real session via <code>hc read</code>.
+  </p>
+</div>
+
+<h2>Three kits, one binary</h2>
+<div class="grid">
+  <div class="card">
+    <h3>hc + room</h3>
+    <p>Protocol SDK: socket, plain&rarr;framed handshake, JSON-RPC, events with seq/missed resync, attach streams with credit, double-negotiated auto-input.</p>
+    <span class="dep">pure Go &middot; zero cgo</span>
+  </div>
+  <div class="card">
+    <h3>pane — the renderer kit</h3>
+    <p>Owns a libghostty-vt emulator per terminal: bytes in, immutable Screen out. Scroll ops, key/mouse encoders, real cell pixels, size-report effects.</p>
+    <span class="dep">go.mitchellh.com/libghostty &middot; pinned b13f277</span>
+  </div>
+  <div class="card">
+    <h3>ui — the multiplexer</h3>
+    <p>bloom tree, sidebar with OSC 7501 agent badges, geometry-driven RESIZE, scroll indicator overlay. A 21-line adapter is the only place the contracts meet.</p>
+    <span class="dep">bloomfx.dev/bloom &middot; bubbletea v2</span>
+  </div>
+</div>
+
+<h2>What works today</h2>
+<ul class="feats">
+  <li><span class="k">[x]</span> Attach to any core terminal by id, title, or name; auto-attach or <code>LOOM_ATTACH</code></li>
+  <li><span class="k">[x]</span> Full input path: kitty/legacy keys, paste, mouse with per-pane SGR encoding</li>
+  <li><span class="k">[x]</span> Layout-driven RESIZE with the last-active-viewer rule; vim redraws at pane size</li>
+  <li><span class="k">[x]</span> Scrollback: wheel and PageUp/Down, viewport parked in history, live indicator, return-to-live</li>
+  <li><span class="k">[x]</span> Real cell pixels end to end: own TIOCGWINSZ, truthful CSI 14t/16t answers, FACTS on the wire</li>
+  <li><span class="k">[x]</span> Agent status from OSC 7501 events — badges in the sidebar, never screen-scraped</li>
+  <li><span class="k">[x]</span> Stream lifecycle machine: lost, restarted, finished as states, want-attach as a state</li>
+  <li><span class="k">[x]</span> Live-gated integration tests (<code>make verify</code>) against a real core</li>
+</ul>
+
+<h2>Frame budget, measured</h2>
+<table>
+  <tr><th>leg</th><th>before</th><th>after</th><th>note</th></tr>
+  <tr><td>dense assembly (200&times;60)</td><td class="was">2.55 ms</td><td class="num">0.47 ms</td><td>92,428&rarr;2 allocs; hillclimb, 3 kept of 5</td></tr>
+  <tr><td>typical styled frame, end to end</td><td class="was">&mdash;</td><td class="num">&asymp;1.1 ms</td><td>13% of the 8.33 ms budget at 120 fps</td></tr>
+  <tr><td>pane publish per changed frame</td><td class="was">&mdash;</td><td class="num">0.40 ms</td><td>VTWrite + RenderState + Screen build</td></tr>
+  <tr><td>idle pane</td><td class="was">&mdash;</td><td class="num">1.45 ns</td><td>zero allocs; bloom unchanged-frame path</td></tr>
+</table>
+
+<h2>Build</h2>
+<p style="font-size:14px; color:var(--dim); max-width:72ch;">
+  <code style="color:var(--green)">make deps</code> fetches ghostty at the pinned commit and builds
+  libghostty-vt via zig, then <code style="color:var(--green)">make verify</code> runs the race suite plus the
+  live gates. One command, reproducible, no sibling checkouts.
+</p>
+
+<footer>
+  <span>loom @ <code>6fe2b08</code> &middot; spike M1 closed, M2 items 1&ndash;4 landed &middot; every claim on this page was verified on a live core this session</span>
+  <span>
+    <a href="https://herdr.dev/core">herdr-core</a> &middot;
+    <a href="https://bloomfx.dev">bloom</a> &middot;
+    <a href="https://lib.ghostty.org">libghostty-vt</a>
+  </span>
+</footer>
+
+</div>
+</body>
+</html>

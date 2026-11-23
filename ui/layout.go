@@ -13,14 +13,14 @@ import (
 )
 
 // inputMode is the keyboard state machine, not booleans: passthrough feeds
-// the focused pane, prefix swallows exactly one key, and the chooser is
-// reserved for wave 2's window picker.
+// the focused pane, prefix swallows exactly one key, and the sidebar mode
+// is the list owning every key until esc, q, enter or a click hands them back.
 type inputMode uint8
 
 const (
 	modePassthrough inputMode = iota
 	modePrefix
-	modeChooser // <leader> w's window list: owns every key until it closes
+	modeSidebar // <leader> w: the sidebar list has the cursor and owns every key
 )
 
 // command is what a bound key means. The enum, not the rune, is the
@@ -31,7 +31,7 @@ type command uint8
 const (
 	cmdSplitVertical   command = iota // 'v': side-by-side halves (Row)
 	cmdSplitHorizontal                // '-': stacked halves (Column)
-	cmdChooseWindow                   // 'w': the window chooser over the room's terminals
+	cmdChooseWindow                   // 'w': hand the keyboard to the sidebar list
 )
 
 // bindings is the single source of key meaning: rune to command. Shifted
@@ -75,7 +75,7 @@ type paneSlot struct {
 	p    *pane.Pane
 	node *PaneNode
 
-	stream       *hcStream // the slot's stream adapter: Detach is the chooser's clean CLOSE
+	stream       *hcStream // the slot's stream adapter: Detach is the sidebar pick's clean CLOSE
 	sentW, sentH int       // last size posted from solved frame geometry
 	liveSeen     bool      // first live wake paid this pane's FOCUS/facts debts yet
 }
@@ -111,8 +111,8 @@ func (n *layoutNode) split(id hc.TerminalID, fresh *layoutNode, vert bool) bool 
 }
 
 // replace swaps the pane held by the leaf with the given id and reports
-// whether the tree changed. The chooser's fresh-attach path uses it: the
-// slot's geometry and siblings stay, only the pane behind the leaf swaps.
+// whether the tree changed. The sidebar's fresh pick uses it: the slot's
+// geometry and siblings stay, only the pane behind the leaf swaps.
 func (n *layoutNode) replace(id hc.TerminalID, fresh *paneSlot) bool {
 	if n.leaf != nil {
 		if n.leaf.id != id {

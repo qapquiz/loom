@@ -242,16 +242,16 @@ func TestMouseForwardsToHitPaneNotFocusedPane(t *testing.T) {
 func TestSidebarMarksAfterSplit(t *testing.T) {
 	_, a := splitApp(t, true)
 	a.Update(eventMsg{<-a.sess.Events()}) // the created event for t9
-	s := sidebar(&a.room, a.focus, a.openPanes())
+	s := sidebar(&a.room, a.focus, a.openPanes(), nil)
 	lines := strings.Split(s, "\n")
-	if len(lines) != 2 {
+	if len(lines) != 3 { // header + two terminals
 		t.Fatalf("sidebar = %q", s)
 	}
-	if !strings.HasPrefix(lines[0], "· vim") {
-		t.Fatalf("open non-focused pane not marked: %q", lines[0])
+	if !strings.HasPrefix(lines[1], "· vim") {
+		t.Fatalf("open non-focused pane not marked: %q", lines[1])
 	}
-	if !strings.HasPrefix(lines[1], "▸") {
-		t.Fatalf("focused pane not marked: %q", lines[1])
+	if !strings.HasPrefix(lines[2], "▸") {
+		t.Fatalf("focused pane not marked: %q", lines[2])
 	}
 }
 

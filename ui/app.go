@@ -8,7 +8,6 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"bloomfx.dev/bloom"
-	"bloomfx.dev/bloom/fx"
 	"golang.org/x/sys/unix"
 
 	"loom/hc"
@@ -31,7 +30,7 @@ type App struct {
 	focus        hc.TerminalID               // the pane keys and paste go to
 	mode         inputMode                   // keyboard state machine
 
-	chooser *chooserState // the open window chooser; non-nil iff mode == modeChooser
+	nav *sidebarNav // the sidebar list's cursor; non-nil iff mode == modeSidebar
 
 	wake          chan struct{}
 	width, height int
@@ -110,6 +109,9 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, cmd)
 		}
 	case tea.PasteMsg:
+		if a.mode == modeSidebar {
+			break // the sidebar owns keys, and a paste is keys
+		}
 		a.sendKey(pane.Key{Text: msg.Content})
 	case tea.MouseClickMsg, tea.MouseReleaseMsg, tea.MouseMotionMsg, tea.MouseWheelMsg:
 		a.routeMouse(msg.(tea.MouseMsg))
@@ -128,15 +130,15 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // from any mode. In prefix mode the key is swallowed either way: bound →
 // command, unbound → dropped, second ctrl+b → a literal 0x02 forwarded to
 // the focused pane (tmux semantics). ctrl+b enters prefix only from
-// passthrough — the chooser owns its keys and swallows all of them: nothing
+// passthrough — the sidebar owns its keys and swallows all of them: nothing
 // reaches the panes, and the prefix machinery never nests inside it.
 func (a *App) key(msg tea.KeyPressMsg) tea.Cmd {
 	if msg.Code == 'q' && msg.Mod&tea.ModCtrl != 0 {
 		a.mode = modePassthrough
 		return tea.Quit
 	}
-	if a.mode == modeChooser {
-		a.chooserKey(msg)
+	if a.mode == modeSidebar {
+		a.sidebarKey(msg)
 		return nil
 	}
 	if a.mode == modePrefix {
@@ -162,8 +164,8 @@ func (a *App) key(msg tea.KeyPressMsg) tea.Cmd {
 }
 
 // runCommand executes one bound command. Splits spawn a shell in a new
-// terminal and graft it beside the focused pane once Run answers; the
-// chooser opens its window list over the pane area.
+// terminal and graft it beside the focused pane once Run answers; 'w' hands
+// the keyboard to the sidebar list.
 func (a *App) runCommand(cmd command) tea.Cmd {
 	switch cmd {
 	case cmdSplitVertical:
@@ -171,7 +173,7 @@ func (a *App) runCommand(cmd command) tea.Cmd {
 	case cmdSplitHorizontal:
 		return a.split(false)
 	case cmdChooseWindow:
-		a.openChooser()
+		a.enterSidebar()
 	}
 	return nil
 }
@@ -233,8 +235,8 @@ func (a *App) onEvent(ev hc.Event) {
 		if a.tree == nil {
 			a.attachFirst()
 		}
-		if a.chooser != nil {
-			a.chooser.refresh(&a.room, a.openPanes()) // the list is live while open
+		if a.nav != nil {
+			a.nav.place(sidebarRows(&a.room, a.openPanes()), a.nav.sel) // the cursor keeps its terminal; a removed one falls to the top
 		}
 	}
 	s := a.panes[ev.ID]
@@ -303,7 +305,8 @@ func pickAttach(r *room.Room, want string) hc.TerminalID {
 // newSlot builds one pane slot for id: the pane, its stream adapter and its
 // bloom leaf, wired to the session exactly like every other pane. addPane
 // splits it in beside the focus; replaceFocused swaps it into the focused
-// leaf; the wiring is one shape either way.
+// leaf, the sidebar pick's fresh-attach path; the wiring is one shape either
+// way.
 func (a *App) newSlot(id hc.TerminalID) *paneSlot {
 	p := pane.New(string(id), a.notify)
 	p.SetPump(a.sess.Do)
@@ -339,6 +342,43 @@ func (a *App) addPane(id hc.TerminalID, vert bool) {
 	// attach — recorded while not live, imposed by Connected's reconcile
 	// (the pane's own idempotence makes the re-post an echo, not a fight).
 	p.SetCellPx(a.cellW, a.cellH)
+	a.postSize(a.width, a.height)
+}
+
+// replaceFocused grafts id into the focused pane's slot, the sidebar pick's
+// fresh-attach path: a fresh pane.Pane takes the leaf (the slot's geometry
+// and siblings stay), the old pane's stream CLOSEs — detached cleanly, the
+// ack walks it back to idle — and the replaced terminal keeps running in
+// the core, untouched. Focus moves without a goodbye FOCUS 0: the CLOSE
+// supersedes it. The debts mirror addPane's: attach intent, cell px, and the
+// solved size.
+func (a *App) replaceFocused(id hc.TerminalID) {
+	if id == "" {
+		return
+	}
+	if _, dup := a.panes[id]; dup {
+		return
+	}
+	old := a.panes[a.focus]
+	s := a.newSlot(id)
+	a.panes[id] = s
+	switch {
+	case old == nil || a.tree == nil:
+		a.tree = &layoutNode{leaf: s} // the empty-room first pane
+		a.bootstrapped = true
+	case a.tree.replace(old.id, s):
+		// the focused leaf swapped in place
+	default:
+		a.tree = &layoutNode{leaf: s} // unreachable: panes and leaves are one set
+	}
+	a.focus = id
+	if old != nil {
+		delete(a.panes, old.id)
+		old.stream.Detach()
+	}
+	s.p.Change(pane.ChangeAttach)
+	s.p.Enqueue(pane.Op{Kind: pane.OpActive, Active: true}) // the focus debt, paid while not live
+	s.p.SetCellPx(a.cellW, a.cellH)
 	a.postSize(a.width, a.height)
 }
 
@@ -501,11 +541,18 @@ func (a *App) postSize(w, h int) {
 
 // routeMouse hit-tests the pane rects first: a click focuses the pane it
 // landed in before any forwarding decision, and wheel scrolling and MouseOn
-// forwarding apply to that hit pane, not the focused one. The solve mirrors
-// View's layout, so routing works before a frame exists on screen.
+// forwarding apply to that hit pane, not the focused one. A click while the
+// sidebar list has the keyboard hands it back first, so the click lands
+// with passthrough semantics wherever it fell, over a pane or not. The
+// solve mirrors View's layout, so routing works before a frame exists on
+// screen.
 func (a *App) routeMouse(msg tea.MouseMsg) {
+	_, click := msg.(tea.MouseClickMsg)
+	if click && a.mode == modeSidebar {
+		a.leaveSidebar()
+	}
 	hit := a.hitPane(msg.Mouse())
-	if _, ok := msg.(tea.MouseClickMsg); ok && hit != nil {
+	if click && hit != nil {
 		a.setFocus(hit.id)
 	}
 	if w, ok := msg.(tea.MouseWheelMsg); ok && a.scrollWheel(hit, w) {
@@ -614,18 +661,10 @@ func (a *App) layout() bloom.Child {
 	if a.tree != nil {
 		body = a.tree.child()
 	}
-	if a.chooser != nil {
-		// The chooser is a centered layer over the pane area, not a full
-		// modal: the panes keep rendering beneath a light dim, and the
-		// sidebar stays bright beside it.
-		body = bloom.Overlay(body,
-			bloom.Layer(bloom.Text(a.chooser.view(a))).
-				Margin(1).Backdrop(fx.Dim{Amount: chooserDim}))
-	}
 	return bloom.Column(
 		bloom.Fill(
 			bloom.Row(
-				bloom.Fixed(sidebarWidth, bloom.Text(sidebar(&a.room, a.focus, a.openPanes()))),
+				bloom.Fixed(sidebarWidth, bloom.Text(sidebar(&a.room, a.focus, a.openPanes(), a.nav))),
 				bloom.Fill(body),
 			),
 		),

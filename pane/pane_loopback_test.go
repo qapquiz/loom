@@ -340,3 +340,35 @@ func TestFactsFrameHitsWireWithSchemaFieldNames(t *testing.T) {
 		}
 	}
 }
+
+// Close releases the emulator and makes the pane inert: later deltas and ops
+// do nothing, and the last Screen stays readable. emu is pump-owned, so the
+// release is observed on the pump goroutine, never from the test goroutine.
+func TestCloseReleasesEmulatorAndGoesInert(t *testing.T) {
+	core := testcore.Serve(t)
+	sess, p := wirePane(t, core, true)
+	attach(t, p)
+	core.Delta([]byte("kept"))
+	if !waitFor(2*time.Second, func() bool { return strings.Contains(screenText(p.Screen()), "kept") }) {
+		t.Fatal("no paint")
+	}
+	p.Close()
+	released := make(chan bool, 1)
+	sess.Do(func() { released <- p.emu == nil })
+	select {
+	case ok := <-released:
+		if !ok {
+			t.Fatal("emulator not released")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("pump never ran the release check")
+	}
+	before := p.Screen()
+	core.Delta([]byte("after"))
+	p.Enqueue(Op{Kind: OpScrollBottom})
+	time.Sleep(100 * time.Millisecond)
+	if p.Screen() != before {
+		t.Fatal("screen changed after Close")
+	}
+	p.Close() // idempotent
+}

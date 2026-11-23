@@ -101,6 +101,7 @@ type Pane struct {
 	pump    func(func()) // the session runner; set by SetPump before first use
 	screen  atomic.Pointer[Screen]
 	state   atomic.Uint32 // machine state; written only on the session goroutine, read from any
+	closed  atomic.Bool   // set by Close on the pump; makes enqueue a no-op afterwards
 	out     StreamOut
 	active  bool
 	wantCol uint16
@@ -171,7 +172,17 @@ func (p *Pane) enqueue(v any) {
 		return
 	}
 	p.pump(func() {
+		if p.closed.Load() {
+			return
+		}
 		switch v := v.(type) {
+		case closeOp:
+			p.closed.Store(true)
+			if p.emu != nil {
+				p.emu.close()
+				p.emu = nil
+			}
+			p.out = nil
 		case Op:
 			p.apply(v)
 		case Change:
@@ -231,6 +242,18 @@ func (p *Pane) applyChange(ch Change) {
 // SetAttachFn wires the attach effect to a session; called once at app
 // setup before any machine run.
 func (p *Pane) SetAttachFn(fn func()) { p.attachFn = fn }
+
+// Close tears the pane down on the pump goroutine: the emulator handles are
+// released and every later enqueued op or change is dropped. Safe to call
+// more than once and from any goroutine. The pane keeps its last Screen so a
+// caller that still holds it renders something instead of nothing.
+func (p *Pane) Close() {
+	p.enqueue(closeOp{})
+}
+
+// closeOp rides the pump queue like an Op so teardown is ordered after work
+// already queued and never races a Delta on the handles.
+type closeOp struct{}
 
 func (p *Pane) wakeOnce() {
 	if p.wake != nil {

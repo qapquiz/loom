@@ -25,10 +25,11 @@ type App struct {
 	ui   *bloom.Root
 	room room.Room
 
-	tree  *layoutNode                 // pane layout; nil until the first attach
-	panes map[hc.TerminalID]*paneSlot // every open slot, by terminal id
-	focus hc.TerminalID               // the pane keys and paste go to
-	mode  inputMode                   // keyboard state machine
+	tree         *layoutNode                 // pane layout; nil until the first attach
+	bootstrapped bool                        // the first pane ever arrived; an empty tree after it is a closed layout, not a cold start
+	panes        map[hc.TerminalID]*paneSlot // every open slot, by terminal id
+	focus        hc.TerminalID               // the pane keys and paste go to
+	mode         inputMode                   // keyboard state machine
 
 	chooser *chooserState // the open window chooser; non-nil iff mode == modeChooser
 
@@ -247,8 +248,10 @@ func (a *App) onEvent(ev hc.Event) {
 		s.p.Change(pane.ChangeRestarted)
 	case hc.EventFinished:
 		s.p.Change(pane.ChangeFinished)
+		a.removePane(ev.ID) // the room's finish is final even when the stream's own CLOSE has not landed yet
 	case hc.EventRemoved:
 		s.p.Change(pane.ChangeRemoved)
+		a.removePane(ev.ID)
 	case hc.EventCreated:
 		s.p.Change(pane.ChangeCreated)
 	case hc.EventSize:
@@ -265,7 +268,7 @@ func (a *App) onEvent(ev hc.Event) {
 // attachFirst auto-attaches the one initial pane once the room knows a
 // candidate; later panes only ever come from splits.
 func (a *App) attachFirst() {
-	if a.tree != nil {
+	if a.tree != nil || a.bootstrapped {
 		return
 	}
 	id := pickAttach(&a.room, os.Getenv("LOOM_ATTACH"))
@@ -324,6 +327,7 @@ func (a *App) addPane(id hc.TerminalID, vert bool) {
 	a.panes[id] = s
 	if a.tree == nil {
 		a.tree = &layoutNode{leaf: s}
+		a.bootstrapped = true
 	} else {
 		a.tree.split(a.focus, &layoutNode{leaf: s}, vert)
 	}
@@ -338,11 +342,76 @@ func (a *App) addPane(id hc.TerminalID, vert bool) {
 	a.postSize(a.width, a.height)
 }
 
-// onWake pays each pane's attach-confirmation debts on its first live
-// frame: viewer activity (the focused pane active, the others passive) and
-// the Display facts queued while not live, which the pane's phase gate
-// dropped — the same debt the single-pane app paid on its one first wake.
+// removePane takes a final pane out of the layout (tmux pane-close
+// semantics, reversing wave 1's keep-final-content): the leaf leaves the
+// tree, the Fill halves refill around the survivor, and postSize posts the
+// survivors' drifted rects as RESIZE. Focus falls to the removed leaf's
+// sibling subtree when the pane held it, else stays put; a lone pane's exit
+// empties the tree and the placeholder body renders. The pane's stream
+// CLOSEs too, so a room finish that beat the stream's own CLOSE stops the
+// core feeding a pane nobody renders. The room record stands untouched,
+// still listed as finished; idempotent, so the stream and room notices may
+// race onto the same removal.
+func (a *App) removePane(id hc.TerminalID) {
+	s, ok := a.panes[id]
+	if !ok {
+		return
+	}
+	var heir *layoutNode
+	switch {
+	case a.tree == nil:
+	case a.tree.leaf != nil:
+		if a.tree.leaf.id == id {
+			a.tree = nil
+		}
+	default:
+		if sub, removed := a.tree.removeLeaf(id); removed {
+			heir = sub
+		}
+	}
+	delete(a.panes, id)
+	s.stream.Detach()
+	s.p.Close() // release the emulator; a detached-but-retained pane would leak its cgo handles
+	if a.focus == id {
+		a.focus = ""
+		sub := heir
+		if sub == nil && a.tree != nil {
+			sub = a.tree
+		}
+		if sub != nil {
+			sub.leaves(func(l *paneSlot) {
+				if a.focus == "" {
+					a.focus = l.id
+				}
+			})
+		}
+		// No goodbye FOCUS 0 to the removed pane: its CLOSE supersedes one.
+		if next := a.panes[a.focus]; next != nil {
+			next.p.Enqueue(pane.Op{Kind: pane.OpActive, Active: true})
+		}
+	}
+	a.postSize(a.width, a.height)
+}
+
+// onWake first reaps panes whose stream ended final — exited or gone,
+// never lost (LostLive is the reattach path, its slot must survive a
+// keep-terminal restart) — then pays each pane's attach-confirmation debts
+// on its first live frame: viewer activity (the focused pane active, the
+// others passive) and the Display facts queued while not live, which the
+// pane's phase gate dropped — the same debt the single-pane app paid on its
+// one first wake. Reaping first means the heir already holds focus when the
+// debt pass runs, so the swap costs the wire one FOCUS, not a 0-then-1
+// blip.
 func (a *App) onWake() {
+	var final []hc.TerminalID
+	for _, s := range a.panes {
+		if ph := s.p.Phase(); ph == pane.StateExited || ph == pane.StateGone {
+			final = append(final, s.id)
+		}
+	}
+	for _, id := range final {
+		a.removePane(id)
+	}
 	for _, s := range a.panes {
 		if !s.liveSeen && s.p.Phase() == pane.StateAttached {
 			s.liveSeen = true

@@ -127,6 +127,31 @@ func (n *layoutNode) replace(id hc.TerminalID, fresh *paneSlot) bool {
 	return n.b.replace(id, fresh)
 }
 
+// removeLeaf drops the leaf holding id and reports the subtree that took
+// over its space (the removed pane's sibling, the focus heir) and whether
+// the tree changed. The parent collapses onto the surviving child, so the
+// Fill/Fill halves refill with no stored geometry to fix; a root that is
+// itself the removed leaf is the App's case, never this one's.
+func (n *layoutNode) removeLeaf(id hc.TerminalID) (*layoutNode, bool) {
+	if n.leaf != nil {
+		return nil, false
+	}
+	if n.a.leaf != nil && n.a.leaf.id == id {
+		heir := n.b
+		*n = *n.b
+		return heir, true
+	}
+	if n.b.leaf != nil && n.b.leaf.id == id {
+		heir := n.a
+		*n = *n.a
+		return heir, true
+	}
+	if heir, ok := n.a.removeLeaf(id); ok {
+		return heir, true
+	}
+	return n.b.removeLeaf(id)
+}
+
 // leaves walks the tree's slots in layout order (a before b).
 func (n *layoutNode) leaves(fn func(*paneSlot)) {
 	if n.leaf != nil {

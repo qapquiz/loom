@@ -2,7 +2,8 @@ package ui
 
 // Multi-pane loopback tests: splits through the real key path, per-pane
 // RESIZE from a solved tree at two sizes, focused-only key routing, click
-// focus, wheel routing to the hit pane, and slots surviving exit.
+// focus, wheel routing to the hit pane, and panes closing on final stream
+// ends (tmux pane-close semantics).
 
 import (
 	"strings"
@@ -254,28 +255,126 @@ func TestSidebarMarksAfterSplit(t *testing.T) {
 	}
 }
 
-// A finished pane keeps its slot and its final content; the tree never
-// empty-panics and loom keeps rendering.
-func TestPaneFinishKeepsSlotShowingFinalContent(t *testing.T) {
+// nextEvent reads one delivered room event into the app the way the tea
+// loop would, so scripted core events can be told apart from the created
+// notices a split's terminal.run already queued.
+func nextEvent(t *testing.T, a *App) hc.Event {
+	t.Helper()
+	select {
+	case ev := <-a.sess.Events():
+		a.Update(eventMsg{ev})
+		return ev
+	case <-time.After(2 * time.Second):
+		t.Fatal("event never delivered")
+		return hc.Event{}
+	}
+}
+
+// A pane whose stream CLOSEs exited leaves the layout (tmux semantics,
+// reversing wave 1's keep-final-content): the slot is gone, the survivor's
+// Fill half refills to full width and posts its drifted rect as RESIZE,
+// and focus falls to the removed pane's sibling.
+func TestPaneExitClosesSlotAndReflows(t *testing.T) {
 	c, a := splitApp(t, true)
-	c.DeltaCh(8, []byte("final-words"))
-	waitForScreenText(t, a.panes["t9"].p, 2*time.Second, "final-words")
+	waitForFrame(t, c, 2*time.Second, resizeOn(8, 40, 30)) // both halves settled
 	c.CloseStreamCh(8, `{"reason":"exited","exit_code":0}`)
 	if !waitForPhase(t, a.panes["t9"].p, 2*time.Second, pane.StateExited) {
 		t.Fatalf("t9 phase = %v", a.panes["t9"].p.Phase())
 	}
-	if _, ok := a.panes["t9"]; !ok {
-		t.Fatal("finished pane lost its slot")
+	a.Update(wakeMsg{}) // the wake the pane's Closed fired
+	if _, ok := a.panes["t9"]; ok {
+		t.Fatal("exited pane kept its slot")
 	}
-	if !strings.Contains(plainText(a.panes["t9"].p.Screen()), "final-words") {
-		t.Fatal("final content dropped on exit")
+	if a.tree == nil || a.tree.leaf == nil || a.tree.leaf.id != "t7" {
+		t.Fatalf("tree = %+v, want the single survivor t7", a.tree)
 	}
-	a.View() // the tree with an exited leaf still lays out
+	if a.focus != "t7" {
+		t.Fatalf("focus = %v, want the survivor t7", a.focus)
+	}
+	waitForFrame(t, c, 2*time.Second, resizeOn(7, 80, 30))
+	a.View() // the collapsed tree still lays out
 }
 
-// The only pane exiting keeps its slot too; and before any pane ever
-// attaches, the placeholder body renders instead of an empty tree.
-func TestTreeNeverEmptyPanics(t *testing.T) {
+// The room's finished notice removes the pane even when the stream's own
+// CLOSE has not landed: same removal, same reflow, no wake needed.
+func TestRoomFinishedRemovesSlot(t *testing.T) {
+	c, a := splitApp(t, true)
+	waitForFrame(t, c, 2*time.Second, resizeOn(8, 40, 30))
+	nextEvent(t, a) // the split's created notice for t9
+	a.Update(eventMsg{sendCoreEvent(t, c, a.sess, 10, "finished", "t9", `{"reason":"exited","exit_code":0}`)})
+	if _, ok := a.panes["t9"]; ok {
+		t.Fatal("finished pane kept its slot")
+	}
+	if a.focus != "t7" {
+		t.Fatalf("focus = %v, want the heir t7", a.focus)
+	}
+	waitForFrame(t, c, 2*time.Second, resizeOn(7, 80, 30))
+}
+
+// A final pane that was not focused closes without touching focus.
+func TestPaneExitUnfocusedKeepsFocus(t *testing.T) {
+	c, a := splitApp(t, true)
+	waitForFrame(t, c, 2*time.Second, resizeOn(8, 40, 30))
+	press(t, a, tea.MouseClickMsg{X: 30, Y: 5, Button: tea.MouseLeft}) // focus t7
+	if a.focus != "t7" {
+		t.Fatalf("click focus = %v, want t7", a.focus)
+	}
+	c.CloseStreamCh(8, `{"reason":"exited","exit_code":0}`)
+	if !waitForPhase(t, a.panes["t9"].p, 2*time.Second, pane.StateExited) {
+		t.Fatalf("t9 phase = %v", a.panes["t9"].p.Phase())
+	}
+	a.Update(wakeMsg{})
+	if _, ok := a.panes["t9"]; ok {
+		t.Fatal("exited pane kept its slot")
+	}
+	if a.focus != "t7" {
+		t.Fatalf("focus = %v, want t7 untouched", a.focus)
+	}
+}
+
+// Lost is not final: the room's lost notice and a stream CLOSE with a loss
+// reason both park the pane in LostLive with its slot intact, waiting for
+// the keep-terminal restart to reattach.
+func TestPaneLostKeepsSlot(t *testing.T) {
+	c, a := splitApp(t, true)
+	waitForFrame(t, c, 2*time.Second, resizeOn(8, 40, 30))
+	nextEvent(t, a) // the split's created notice for t9
+	a.Update(eventMsg{sendCoreEvent(t, c, a.sess, 10, "lost", "t9", "{}")})
+	if !waitForPhase(t, a.panes["t9"].p, 2*time.Second, pane.StateLostLive) {
+		t.Fatalf("t9 phase = %v, want lost-live", a.panes["t9"].p.Phase())
+	}
+	c.CloseStreamCh(8, `{"reason":"signaled"}`)
+	if !waitForPhase(t, a.panes["t9"].p, 2*time.Second, pane.StateLostLive) {
+		t.Fatalf("t9 phase after loss CLOSE = %v, want still lost-live", a.panes["t9"].p.Phase())
+	}
+	a.Update(wakeMsg{})
+	if _, ok := a.panes["t9"]; !ok {
+		t.Fatal("lost pane lost its slot")
+	}
+	if a.tree == nil || a.tree.leaf != nil || a.tree.a.leaf.id != "t7" || a.tree.b.leaf.id != "t9" {
+		t.Fatalf("tree = %+v, want the split intact", a.tree)
+	}
+	if a.focus != "t9" {
+		t.Fatalf("focus = %v, want t9 untouched", a.focus)
+	}
+}
+
+// Before any pane ever attaches, the placeholder body renders instead of
+// an empty tree — the cold-start half of the placeholder contract; the
+// after-last-exit half lives in TestLastPaneExitShowsPlaceholder.
+func TestEmptyRoomRendersPlaceholder(t *testing.T) {
+	_, empty := newApp(t, `[]`)
+	empty.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	if empty.tree != nil || len(empty.panes) != 0 {
+		t.Fatalf("no-terminal app grew a tree: %v", empty.tree)
+	}
+	empty.View()
+}
+
+// The last pane's exit empties the tree: the placeholder body renders,
+// nothing panics, focus has nowhere to go, and a later room change does not
+// silently auto-attach some other listed terminal into the dead layout.
+func TestLastPaneExitShowsPlaceholder(t *testing.T) {
 	c, a := newApp(t, `[{"address":"t7","title":"vim","cols":80,"rows":24}]`)
 	if !waitForPhase(t, a.panes["t7"].p, 2*time.Second, pane.StateAttached) {
 		t.Fatal("no attach")
@@ -286,17 +385,72 @@ func TestTreeNeverEmptyPanics(t *testing.T) {
 	if !waitForPhase(t, a.panes["t7"].p, 2*time.Second, pane.StateExited) {
 		t.Fatalf("phase = %v", a.panes["t7"].p.Phase())
 	}
-	if a.tree == nil || a.tree.leaf == nil {
-		t.Fatal("exited only pane dropped the tree")
+	a.Update(wakeMsg{})
+	if a.tree != nil || len(a.panes) != 0 || a.focus != "" {
+		t.Fatalf("tree=%v panes=%v focus=%q, want the empty placeholder state", a.tree, a.panes, a.focus)
 	}
 	a.View()
-
-	_, empty := newApp(t, `[]`)
-	empty.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
-	if empty.tree != nil || len(empty.panes) != 0 {
-		t.Fatalf("no-terminal app grew a tree: %v", empty.tree)
+	press(t, a, tea.KeyPressMsg{Code: 'x', Text: "x"}) // no pane to take it; no panic
+	a.Update(eventMsg{sendCoreEvent(t, c, a.sess, 10, "title", "t7", `{"title":"done"}`)})
+	if len(a.panes) != 0 || a.tree != nil {
+		t.Fatal("room change after the last exit re-attached a pane")
 	}
-	empty.View()
+}
+
+// Three panes, the middle leaf of the tree closes: the column collapses, the
+// two survivors reflow, and focus falls to the closed pane's sibling subtree.
+func TestMiddlePaneExitReflowsTree(t *testing.T) {
+	c, a := newRunApp(t, "t9", "t2")
+	if !waitForPhase(t, a.panes["t7"].p, 2*time.Second, pane.StateAttached) {
+		t.Fatal("no attach for t7")
+	}
+	a.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	press(t, a, tea.KeyPressMsg{Code: 'b', Mod: tea.ModCtrl})
+	press(t, a, tea.KeyPressMsg{Code: 'v', Text: "v"}) // t7 | t9
+	if !waitForPhase(t, a.panes["t9"].p, 2*time.Second, pane.StateAttached) {
+		t.Fatal("no attach for t9")
+	}
+	press(t, a, tea.KeyPressMsg{Code: 'b', Mod: tea.ModCtrl})
+	press(t, a, tea.KeyPressMsg{Code: '-', Text: "-"}) // t7 | (t9 / t2)
+	if !waitForPhase(t, a.panes["t2"].p, 2*time.Second, pane.StateAttached) {
+		t.Fatal("no attach for t2")
+	}
+	// Paint every pane first: bloom's solve of a nested split is
+	// content-sensitive (pre-existing, reproduced on the pristine tree), so
+	// the pre-close shape is asserted on the tree itself and the reflow
+	// assertions ride the post-close flat solve, which is stable.
+	c.DeltaCh(7, []byte("left"))
+	c.DeltaCh(8, []byte("mid"))
+	c.DeltaCh(9, []byte("low"))
+	waitForScreenText(t, a.panes["t9"].p, 2*time.Second, "mid")
+	waitForScreenText(t, a.panes["t2"].p, 2*time.Second, "low")
+	if a.tree.b.leaf != nil || a.tree.b.vert || a.tree.b.a.leaf.id != "t9" || a.tree.b.b.leaf.id != "t2" {
+		t.Fatalf("tree = %+v, want t7 | (t9 / t2) before the close", a.tree)
+	}
+
+	press(t, a, tea.MouseClickMsg{X: 70, Y: 5, Button: tea.MouseLeft}) // focus the middle pane t9
+	if a.focus != "t9" {
+		t.Fatalf("click focus = %v, want t9", a.focus)
+	}
+	c.CloseStreamCh(8, `{"reason":"exited","exit_code":0}`)
+	if !waitForPhase(t, a.panes["t9"].p, 2*time.Second, pane.StateExited) {
+		t.Fatalf("t9 phase = %v", a.panes["t9"].p.Phase())
+	}
+	a.Update(wakeMsg{})
+	if _, ok := a.panes["t9"]; ok {
+		t.Fatal("exited middle pane kept its slot")
+	}
+	if a.tree == nil || a.tree.leaf != nil || !a.tree.vert || a.tree.a.leaf.id != "t7" || a.tree.b.leaf.id != "t2" {
+		t.Fatalf("tree = %+v, want t7 | t2", a.tree)
+	}
+	if a.focus != "t2" {
+		t.Fatalf("focus = %v, want the heir t2", a.focus)
+	}
+	// The flat tree solves stably: both survivors reflow to their true
+	// halves and post the drifted rects.
+	waitForFrame(t, c, 2*time.Second, resizeOn(7, 40, 30))
+	waitForFrame(t, c, 2*time.Second, resizeOn(9, 40, 30))
+	a.View()
 }
 
 // Focus churn between panes swaps viewer activity on the wire: the newly

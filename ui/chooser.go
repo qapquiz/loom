@@ -227,6 +227,7 @@ func (a *App) replaceFocused(id hc.TerminalID) {
 	switch {
 	case old == nil || a.tree == nil:
 		a.tree = &layoutNode{leaf: s} // the empty-room first pane
+		a.bootstrapped = true
 	case a.tree.replace(old.id, s):
 		// the focused leaf swapped in place
 	default:
